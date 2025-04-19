@@ -6,9 +6,7 @@ import time
 from collections import defaultdict
 import logging
 
-from voidrail.mq.service import ServiceRouter, ServiceDealer, ClientDealer, service_method
-from voidrail.mq.service.router import RouterMode
-from voidrail.mq.schemas import StreamingBlock, BlockType
+from voidrail import ServiceRouter, RouterMode, ServiceDealer, ClientDealer, service_method
 
 logger = logging.getLogger(__name__)
 

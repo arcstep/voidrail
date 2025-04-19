@@ -5,8 +5,7 @@ import logging
 import time
 import zmq.asyncio
 
-from voidrail.mq.service import ServiceDealer, ServiceRouter, ClientDealer, service_method
-from voidrail.mq.service.router import RouterMode
+from voidrail import ServiceDealer, RouterMode, ServiceRouter, ClientDealer, service_method
 
 logger = logging.getLogger(__name__)
 

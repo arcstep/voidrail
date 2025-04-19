@@ -3,8 +3,7 @@ import pytest_asyncio
 import asyncio
 import zmq.asyncio
 import logging
-from voidrail.mq.service import ServiceRouter, ServiceDealer, ClientDealer, service_method
-from voidrail.mq.schemas import StreamingBlock, BlockType
+from voidrail import ServiceRouter, ServiceDealer, ClientDealer, service_method
 
 logger = logging.getLogger(__name__)
 

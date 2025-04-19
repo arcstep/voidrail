@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 from enum import Enum
 from time import time
 from collections import defaultdict, deque
+import os
 
 import zmq
 import zmq.asyncio
@@ -10,8 +11,6 @@ import asyncio
 import logging
 import json
 import uuid
-
-from ..schemas import ZmqServiceState, ReplyErrorBlock, RequestBlock, ReplyState, ReplyBlock, ErrorBlock
 
 class RouterMode(str, Enum):
     """路由器模式枚举"""
@@ -24,6 +23,13 @@ class ServiceState(str, Enum):
     OVERLOAD = "overload"   # 接近满载，不再接受新请求
     INACTIVE = "inactive"   # 无响应/超时
     SHUTDOWN = "shutdown"   # 主动下线
+
+class RouterState(str, Enum):
+    """ROUTER状态枚举"""
+    INIT = "init"
+    RUNNING = "running"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
 
 class ServiceInfo(BaseModel):
     """服务信息模型"""
@@ -68,13 +74,17 @@ class ServiceRouter:
         address: str, 
         context: Optional[zmq.asyncio.Context] = None,
         heartbeat_timeout: float = 30.0,     # 心跳超时时间（秒）
-        router_mode: RouterMode = RouterMode.FIFO,  # 默认为FIFO模式,
+        router_mode: RouterMode = RouterMode.FIFO,  # 默认为FIFO模式
         hwm: int = 1000,
+        require_auth: bool = None,           # 是否要求认证
+        dealer_api_keys: List[str] = None,   # DEALER 端 API 密钥列表
+        client_api_keys: List[str] = None,   # CLIENT 端 API 密钥列表
     ):
         self._context = context or zmq.asyncio.Context()
         self._address = address
         self._socket = self._context.socket(zmq.ROUTER)
         self._socket.set_hwm(hwm)  # 设置高水位标记
+        self._socket.bind(self._address)
         self._running = False
         self._services: Dict[str, ServiceInfo] = {}
         self._logger = logging.getLogger(__name__)
@@ -83,7 +93,7 @@ class ServiceRouter:
         self._HEARTBEAT_TIMEOUT = heartbeat_timeout
         
         # 状态管理
-        self._state = ZmqServiceState.INIT
+        self._state = RouterState.INIT
         self._state_lock = asyncio.Lock()  # 状态锁
         self._reconnect_in_progress = False
 
@@ -104,6 +114,31 @@ class ServiceRouter:
         # FIFO模式相关
         self._method_queues = defaultdict(deque)  # 为每个方法创建请求队列
         self._dealer_processing = defaultdict(int)  # 记录每个DEALER端当前处理的请求数
+
+        # API密钥认证配置
+        # 首先检查环境变量中是否要求认证
+        env_require_auth = os.environ.get("VOIDRAIL_REQUIRE_AUTH", "").lower()
+        self._require_auth = require_auth if require_auth is not None else (env_require_auth in ('1', 'true', 'yes'))
+        
+        # 加载DEALER端密钥
+        self._dealer_api_keys = dealer_api_keys or []
+        env_dealer_keys = os.environ.get("VOIDRAIL_DEALER_API_KEYS", "")
+        if env_dealer_keys:
+            self._dealer_api_keys.extend([k.strip() for k in env_dealer_keys.split(",") if k.strip()])
+        
+        # 加载CLIENT端密钥
+        self._client_api_keys = client_api_keys or []
+        env_client_keys = os.environ.get("VOIDRAIL_CLIENT_API_KEYS", "")
+        if env_client_keys:
+            self._client_api_keys.extend([k.strip() for k in env_client_keys.split(",") if k.strip()])
+        
+        # 记录已认证的客户端ID
+        self._authenticated_clients = set()
+        
+        if self._require_auth:
+            self._logger.info(f"API密钥认证已启用 (dealer_keys={len(self._dealer_api_keys)}, client_keys={len(self._client_api_keys)})")
+        else:
+            self._logger.info("API密钥认证未启用")
 
     async def _force_reconnect(self):
         """强制完全重置连接"""
@@ -142,11 +177,11 @@ class ServiceRouter:
     async def start(self):
         """启动路由器"""
         async with self._state_lock:
-            if self._state not in [ZmqServiceState.INIT, ZmqServiceState.STOPPED]:
+            if self._state not in [RouterState.INIT, RouterState.STOPPED]:
                 self._logger.warning(f"Cannot start from {self._state} state")
                 return False
                 
-            self._state = ZmqServiceState.RUNNING
+            self._state = RouterState.RUNNING
 
         # 重建连接
         if not await self._reconnect():
@@ -160,10 +195,10 @@ class ServiceRouter:
     async def stop(self):
         """停止路由器"""
         async with self._state_lock:
-            if self._state == ZmqServiceState.STOPPED:
+            if self._state == RouterState.STOPPED:
                 return
                 
-            self._state = ZmqServiceState.STOPPING
+            self._state = RouterState.STOPPING
 
         tasks = []
         if self._message_task:
@@ -180,11 +215,35 @@ class ServiceRouter:
         self._socket = None
             
         async with self._state_lock:
-            self._state = ZmqServiceState.STOPPED
+            self._state = RouterState.STOPPED
             self._logger.info(f"Router stopped")
+
+    def _verify_dealer_api_key(self, api_key: str) -> bool:
+        """验证DEALER端API密钥是否有效"""
+        if not self._require_auth:
+            return True
+        return api_key in self._dealer_api_keys
+
+    def _verify_client_api_key(self, api_key: str) -> bool:
+        """验证CLIENT端API密钥是否有效"""
+        if not self._require_auth:
+            return True
+        return api_key in self._client_api_keys
+
+    def _check_client_auth(self, client_id: str) -> bool:
+        """检查客户端是否已认证"""
+        if not self._require_auth:
+            return True
+        return client_id in self._authenticated_clients
 
     def register_service(self, service_id: str, service_info: Dict[str, Any]):
         """注册服务"""
+        # 验证API密钥
+        api_key = service_info.get('api_key', '')
+        if self._require_auth and not self._verify_dealer_api_key(api_key):
+            self._logger.warning(f"服务认证失败: {service_id}, 提供的API密钥无效")
+            return False
+            
         max_concurrent = service_info.get('max_concurrent', 100)  # 默认最大并发数
         # 保留所有方法信息，不仅仅是metadata
         methods = {
@@ -201,6 +260,7 @@ class ServiceRouter:
             reply_count=service_info.get('reply_count', 0)
         )
         self._logger.info(f"Registered service: {service_id} with max_concurrent={max_concurrent}: {methods}")
+        return True
 
     def unregister_service(self, service_id: str):
         """注销服务"""
@@ -233,7 +293,7 @@ class ServiceRouter:
             - multipart[2:] 根据消息类型各自约定
         """
         self._logger.info(f"Routing messages handler started on {self._address}, {self._socket}")
-        while self._state == ZmqServiceState.RUNNING:
+        while self._state == RouterState.RUNNING:
             try:
                 multipart = await self._socket.recv_multipart()
                 if len(multipart) < 2:
@@ -244,6 +304,33 @@ class ServiceRouter:
                 from_id = from_id_bytes.decode()  # 消息来源ID (str)
                 message_type_bytes = multipart[1]  # 消息类型 (bytes)
                 message_type = message_type_bytes.decode()  # 消息类型 (str)
+                
+                # 处理客户端认证请求
+                if message_type == "auth":
+                    if len(multipart) < 3:
+                        await self._send_error(from_id_bytes, "Invalid auth format")
+                        continue
+                        
+                    auth_data = json.loads(multipart[2].decode())
+                    api_key = auth_data.get("api_key", "")
+                    
+                    if self._verify_client_api_key(api_key):
+                        self._authenticated_clients.add(from_id)
+                        response = {
+                            "type": "reply",
+                            "request_id": str(uuid.uuid4()),
+                            "result": {"status": "authenticated"}
+                        }
+                        await self._socket.send_multipart([
+                            from_id_bytes,
+                            b"auth_ack",
+                            json.dumps(response).encode()
+                        ])
+                        self._logger.info(f"Client 认证成功: {from_id}")
+                    else:
+                        await self._send_error(from_id_bytes, "Authentication failed")
+                        self._logger.warning(f"Client 认证失败: {from_id}")
+                    continue
                 
                 # 将锁的范围缩小到关键部分
                 async with self._service_lock:
@@ -264,20 +351,43 @@ class ServiceRouter:
                     ])
 
                 elif message_type == "register":
+                    if len(multipart) < 3:
+                        await self._send_error(from_id_bytes, "Invalid register format")
+                        continue
+                        
                     async with self._service_lock:  # 单独加锁
                         service_info = json.loads(multipart[2].decode())
-                        self.register_service(from_id, service_info)
-                        # 只在首次注册时设置ACTIVE状态
-                        if from_id not in self._services:
-                            self._services[from_id].state = ServiceState.ACTIVE
-                    await self._socket.send_multipart([
-                        from_id_bytes,
-                        b"register_ack",
-                        b""
-                    ])
+                        registration_success = self.register_service(from_id, service_info)
+                        
+                        if registration_success:
+                            # 只在首次注册时设置ACTIVE状态
+                            if from_id not in self._services:
+                                self._services[from_id].state = ServiceState.ACTIVE
+                                
+                            await self._socket.send_multipart([
+                                from_id_bytes,
+                                b"register_ack",
+                                b""
+                            ])
+                        else:
+                            await self._send_error(from_id_bytes, "Registration failed: invalid API key")
                     
                 elif message_type == "heartbeat":
-                    # 处理心跳消息 - 始终响应，无论服务之前状态如何
+                    # 处理心跳消息
+                    heartbeat_data = {}
+                    if len(multipart) >= 3:
+                        try:
+                            heartbeat_data = json.loads(multipart[2].decode())
+                        except:
+                            pass
+                    
+                    api_key = heartbeat_data.get("api_key", "")
+                    
+                    # 如果需要认证，则验证API密钥
+                    if self._require_auth and from_id not in self._services and not self._verify_dealer_api_key(api_key):
+                        await self._send_error(from_id_bytes, "Heartbeat authentication failed")
+                        continue
+                    
                     if from_id in self._services.keys():
                         # 发送心跳确认消息 (已在上面更新了状态)
                         await self._socket.send_multipart([
@@ -290,6 +400,11 @@ class ServiceRouter:
                         self._logger.warning(f"Received heartbeat from unregistered service: {from_id}")
                 
                 elif message_type == "clusters":
+                    # 客户端认证检查
+                    if self._require_auth and not self._check_client_auth(from_id):
+                        await self._send_error(from_id_bytes, "Not authenticated")
+                        continue
+                        
                     # 收集所有可用的 DEALERS 节点信息
                     response = {
                         "type": "reply",
@@ -305,6 +420,11 @@ class ServiceRouter:
                     ])
                     
                 elif message_type == "methods":
+                    # 客户端认证检查
+                    if self._require_auth and not self._check_client_auth(from_id):
+                        await self._send_error(from_id_bytes, "Not authenticated")
+                        continue
+                        
                     # 收集所有可用的方法信息
                     available_methods = {}
                     for service in self._services.values():
@@ -326,6 +446,11 @@ class ServiceRouter:
                     ])
                     
                 elif message_type == "call_from_client":
+                    # 客户端认证检查
+                    if self._require_auth and not self._check_client_auth(from_id):
+                        await self._send_error(from_id_bytes, "Not authenticated")
+                        continue
+                        
                     if len(multipart) < 3:
                         self._logger.error(f"Invalid call message format")
                         continue
@@ -419,6 +544,11 @@ class ServiceRouter:
                                 await self._process_fifo_queue(method_name)
 
                 elif message_type == "queue_status":
+                    # 客户端认证检查
+                    if self._require_auth and not self._check_client_auth(from_id):
+                        await self._send_error(from_id_bytes, "Not authenticated")
+                        continue
+                        
                     # 收集队列状态信息
                     queue_stats = {}
                     for method_name, queue in self._method_queues.items():
@@ -453,6 +583,11 @@ class ServiceRouter:
                     ])
 
                 elif message_type == "router_info":
+                    # 客户端认证检查
+                    if self._require_auth and not self._check_client_auth(from_id):
+                        await self._send_error(from_id_bytes, "Not authenticated")
+                        continue
+                        
                     # 提供路由器的配置信息
                     router_info = {
                         "mode": self._router_mode.value,  # FIFO或LOAD_BALANCE
@@ -462,7 +597,8 @@ class ServiceRouter:
                         "total_services": len(self._services),
                         "queue_stats": {
                             method: len(queue) for method, queue in self._method_queues.items()
-                        }
+                        },
+                        "auth_required": self._require_auth
                     }
                     
                     response = {
@@ -482,7 +618,10 @@ class ServiceRouter:
 
             except Exception as e:
                 self._logger.error(f"Router error: {e}", exc_info=True)
-                await self._send_error(from_id_bytes, f"Service Router Error")
+                try:
+                    await self._send_error(from_id_bytes, f"Service Router Error")
+                except:
+                    pass
 
     async def _process_fifo_queue(self, method_name: str):
         """处理FIFO模式下的请求队列"""
@@ -565,7 +704,7 @@ class ServiceRouter:
     async def _check_service_health(self):
         """检查服务健康状态"""
         self._logger.info(f"Dealer service health check handler started")
-        while self._state == ZmqServiceState.RUNNING:
+        while self._state == RouterState.RUNNING:
             current_time = time()
             
             # 检查服务心跳

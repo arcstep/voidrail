@@ -5,11 +5,8 @@ import asyncio
 import logging
 import json
 import uuid
+import os
 from contextlib import asynccontextmanager
-from ..schemas import (
-    RequestBlock, ReplyBlock, StreamingBlock, 
-    EndBlock, ErrorBlock, RequestStep
-)
 
 class ClientDealer:
     """客户端 DEALER 实现，按需连接"""
@@ -17,7 +14,8 @@ class ClientDealer:
         self,
         router_address: str,
         context: Optional[zmq.asyncio.Context] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
+        api_key: Optional[str] = None
     ):
         self._router_address = router_address
         self._timeout = timeout
@@ -28,7 +26,15 @@ class ClientDealer:
         self._lock = asyncio.Lock()
         self._connected = False
         self._client_id = str(uuid.uuid4().hex)
-        self._available_methods = {}  # 缓存可用方法        
+        self._available_methods = {}  # 缓存可用方法
+        
+        # API密钥设置
+        self._api_key = api_key or os.environ.get("VOIDRAIL_API_KEY")
+        if not self._api_key:
+            self._logger.warning(f"ClientDealer: 未设置API密钥，可能无法连接到开启了验证的Router")
+        
+        # 认证状态
+        self._authenticated = False
 
     async def connect(self):
         """连接到路由器"""
@@ -37,11 +43,64 @@ class ClientDealer:
             self._socket = self._context.socket(zmq.DEALER)
             self._socket.identity = self._client_id.encode()
             self._socket.connect(self._router_address)
+            
+            # 如果有API密钥，先尝试认证
+            if self._api_key:
+                await self._authenticate()
+            
             self._connected = True
             self._logger.info(f"Connected to router at {self._router_address}, {self._socket}")
 
             # 连接后立即更新可用方法
             await self.discover_services()
+
+    async def _authenticate(self):
+        """向Router发送认证请求"""
+        if self._authenticated:
+            return True
+            
+        try:
+            auth_request = {
+                "api_key": self._api_key,
+                "client_id": self._client_id
+            }
+            
+            await self._socket.send_multipart([
+                b"auth",
+                json.dumps(auth_request).encode()
+            ])
+            
+            multipart = await asyncio.wait_for(
+                self._socket.recv_multipart(),
+                timeout=self._timeout
+            )
+            
+            message_type = multipart[0] if len(multipart) >= 1 else b""
+            
+            if message_type == b"auth_ack":
+                response_data = multipart[-1].decode()
+                response = json.loads(response_data)
+                
+                if response.get("type") == "reply":
+                    self._authenticated = True
+                    self._logger.info("客户端认证成功")
+                    return True
+                elif response.get("type") == "error":
+                    self._logger.error(f"认证失败: {response.get('error')}")
+                    return False
+            elif message_type == b"error":
+                error_msg = multipart[-1].decode() if len(multipart) > 1 else "Unknown error"
+                self._logger.error(f"认证错误: {error_msg}")
+                return False
+                
+            return False
+                
+        except asyncio.TimeoutError:
+            self._logger.error("认证超时")
+            return False
+        except Exception as e:
+            self._logger.error(f"认证过程中发生错误: {e}")
+            return False
 
     async def close(self):
         """关闭连接"""
@@ -50,6 +109,7 @@ class ClientDealer:
             self._socket.close()
             self._socket = None
         self._connected = False
+        self._authenticated = False
 
     async def __aenter__(self):
         """实现异步上下文管理器入口"""

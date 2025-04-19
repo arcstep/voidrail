@@ -7,6 +7,7 @@ import json
 import inspect
 import uuid
 import time
+import os
 from enum import Enum
 
 from functools import wraps
@@ -130,7 +131,8 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         service_name: str = None,
         heartbeat_interval: float = 0.5,
         heartbeat_timeout: float = 5.0,
-        service_id: str = None
+        service_id: str = None,
+        api_key: str = None     # 新增: API密钥
     ):
         self._router_address = router_address
         self._hwm = hwm
@@ -174,6 +176,11 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         self._heartbeat_status = False
         self._reconnect_count = 0
         self._max_reconnect_attempts = 10
+        
+        # API密钥设置
+        self._api_key = api_key or os.environ.get("VOIDRAIL_API_KEY")
+        if not self._api_key:
+            self._logger.warning(f"<{self._service_id}> 未设置API密钥，可能无法连接到开启了验证的Router")
 
     async def _force_reconnect(self):
         """强制完全重置连接"""
@@ -342,7 +349,8 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                 "max_concurrent": self._max_concurrent,
                 "current_load": self._current_load,
                 "request_count": 0,
-                "reply_count": 0
+                "reply_count": 0,
+                "api_key": self._api_key  # 添加API密钥
             }
             
             self._logger.info(f"<{self._service_id}> Registering service with info: {service_info}")
@@ -394,6 +402,11 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                     continue
                     
                 message_type = multipart[0]                
+                
+                if len(multipart) < 2:
+                    self._logger.warning(f"<{self._service_id}> Invalid message format, missing target")
+                    continue
+                
                 target_client_id = multipart[1]
                 request_json = multipart[-1].decode() if len(multipart) >= 3 else None
 
@@ -555,7 +568,18 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             try:
                 # 发送心跳
                 if self._socket and self._state == DealerState.RUNNING:
-                    await self._socket.send_multipart([b"heartbeat", b""])
+                    # 在心跳中包含API密钥
+                    heartbeat_data = {}
+                    if self._api_key:
+                        heartbeat_data["api_key"] = self._api_key
+                        
+                    if heartbeat_data:
+                        await self._socket.send_multipart([
+                            b"heartbeat", 
+                            json.dumps(heartbeat_data).encode()
+                        ])
+                    else:
+                        await self._socket.send_multipart([b"heartbeat", b""])
                 
                 if not self._service_registered:
                     await self._register_to_router()
