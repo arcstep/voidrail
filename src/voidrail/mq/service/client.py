@@ -10,7 +10,6 @@ from ..schemas import (
     RequestBlock, ReplyBlock, StreamingBlock, 
     EndBlock, ErrorBlock, RequestStep
 )
-from ..utils import serialize_message, deserialize_message
 
 class ClientDealer:
     """客户端 DEALER 实现，按需连接"""
@@ -110,16 +109,17 @@ class ClientDealer:
                 timeout=timeout
             )
 
-            response = deserialize_message(multipart[-1])
+            response_data = multipart[-1].decode()
+            response = json.loads(response_data)
             self._logger.info(f"Received invoke method response: {response}")
 
-            if isinstance(response, ReplyBlock):
-                self._available_methods = response.result
+            if response.get("type") == "reply":
+                self._available_methods = response.get("result", {})
                 return self._available_methods
-            elif isinstance(response, ErrorBlock):
-                raise RuntimeError(response.error)
+            elif response.get("type") == "error":
+                raise RuntimeError(response.get("error"))
             else:
-                raise ValueError(f"Unexpected response type: {type(response)}")
+                raise ValueError(f"Unexpected response type: {response.get('type')}")
 
         except asyncio.TimeoutError:
             raise TimeoutError(f"[{self._router_address}] Invoke '{method}' timeout")
@@ -148,13 +148,14 @@ class ClientDealer:
                 )
 
         request_id = str(uuid.uuid4())
-        request = RequestBlock(
-            request_id=request_id,
-            func_name=method,
-            request_step=RequestStep.READY,
-            args=args,
-            kwargs=kwargs
-        )
+        request = {
+            "type": "request",
+            "request_id": request_id,
+            "func_name": method,
+            "request_step": "READY",
+            "args": args,
+            "kwargs": kwargs
+        }
 
         if timeout is None:
             timeout = self._timeout
@@ -164,7 +165,7 @@ class ClientDealer:
             await self._socket.send_multipart([
                 b"call_from_client",  # 添加消息类型
                 method.encode(),  # 服务名称
-                serialize_message(request)  # 请求数据
+                json.dumps(request).encode()  # 请求数据
             ])
 
             # 接收响应流
@@ -175,18 +176,22 @@ class ClientDealer:
                         timeout=timeout
                     )
 
-                    response = deserialize_message(multipart[-1])
-                    self._logger.debug(f"Received response type: {type(response)}, content: {response}")
+                    response_data = multipart[-1].decode()
+                    response = json.loads(response_data)
+                    self._logger.debug(f"Received response: {response}")
 
-                    if isinstance(response, StreamingBlock):
-                        if isinstance(response, EndBlock):
-                            return
-                        yield response
-                    elif isinstance(response, ReplyBlock):
-                        yield response.result
+                    # 根据消息类型处理响应
+                    msg_type = response.get("type")
+                    
+                    if msg_type == "streaming":
+                        yield response.get("data")
+                    elif msg_type == "end":
                         return
-                    elif isinstance(response, ErrorBlock):
-                        raise RuntimeError(response.error)
+                    elif msg_type == "reply":
+                        yield response.get("result")
+                        return
+                    elif msg_type == "error":
+                        raise RuntimeError(response.get("error"))
                     else:
                         yield response
 

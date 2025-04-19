@@ -12,7 +12,6 @@ import json
 import uuid
 
 from ..schemas import ZmqServiceState, ReplyErrorBlock, RequestBlock, ReplyState, ReplyBlock, ErrorBlock
-from ..utils import serialize_message, deserialize_message
 
 class RouterMode(str, Enum):
     """路由器模式枚举"""
@@ -211,15 +210,16 @@ class ServiceRouter:
 
     async def _send_error(self, from_id: bytes, error: str):
         """发送错误消息"""
-        error_response = ErrorBlock(
-            request_id=str(uuid.uuid4()),
-            error=error,
-            state="error"
-        )
+        error_response = {
+            "type": "error",
+            "request_id": str(uuid.uuid4()),
+            "error": error,
+            "state": "error"
+        }
         await self._socket.send_multipart([
             from_id,
             b"error",
-            serialize_message(error_response)
+            json.dumps(error_response).encode()
         ])
         self._logger.error(f"Error sending to {from_id}: {error}")
 
@@ -291,16 +291,17 @@ class ServiceRouter:
                 
                 elif message_type == "clusters":
                     # 收集所有可用的 DEALERS 节点信息
-                    response = ReplyBlock(
-                        request_id=str(uuid.uuid4()),
-                        result={
+                    response = {
+                        "type": "reply",
+                        "request_id": str(uuid.uuid4()),
+                        "result": {
                             k: v.model_dump() for k, v in self._services.items()
                         }
-                    )
+                    }
                     await self._socket.send_multipart([
                         from_id_bytes,
                         b"clusters_ack",
-                        serialize_message(response)
+                        json.dumps(response).encode()
                     ])
                     
                 elif message_type == "methods":
@@ -313,14 +314,15 @@ class ServiceRouter:
                                     available_methods[method_name] = method_info
                     
                     self._logger.info(f"Handling discovery request, available methods: {list(available_methods.keys())}")
-                    response = ReplyBlock(
-                        request_id=str(uuid.uuid4()),
-                        result=available_methods
-                    )
+                    response = {
+                        "type": "reply",
+                        "request_id": str(uuid.uuid4()),
+                        "result": available_methods
+                    }
                     await self._socket.send_multipart([
                         from_id_bytes,
                         b"methods_ack",
-                        serialize_message(response)
+                        json.dumps(response).encode()
                     ])
                     
                 elif message_type == "call_from_client":
@@ -358,14 +360,15 @@ class ServiceRouter:
                         else:
                             error_msg = f"No available service for method {service_name}"
                             self._logger.error(f"{error_msg}")
-                            error = ReplyErrorBlock(
-                                request_id=str(uuid.uuid4()),
-                                error=error_msg
-                            )
+                            error = {
+                                "type": "error",
+                                "request_id": str(uuid.uuid4()),
+                                "error": error_msg
+                            }
                             await self._socket.send_multipart([
                                 from_id_bytes,
                                 b"reply_from_router",
-                                serialize_message(error)
+                                json.dumps(error).encode()
                             ])
 
                 elif message_type in ["overload", "resume", "shutdown"]:

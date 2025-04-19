@@ -11,11 +11,6 @@ from enum import Enum
 
 from functools import wraps
 from pydantic import BaseModel
-from ..schemas import (
-    RequestBlock, ReplyBlock, StreamingBlock, EndBlock, 
-    ErrorBlock, BlockType
-)
-from ..utils import serialize_message, deserialize_message
 
 # 新增全局装饰器
 def service_method(_func=None, *, name: str = None, description: str = None, params: dict = None, **metadata):
@@ -400,12 +395,14 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                     
                 message_type = multipart[0]                
                 target_client_id = multipart[1]
-                request = deserialize_message(multipart[-1]) if len(multipart) >= 3 else None
+                request_json = multipart[-1].decode() if len(multipart) >= 3 else None
 
-                if message_type == b"call_from_router" and isinstance(request, RequestBlock):
-                    task = asyncio.create_task(self._process_request(target_client_id, request), name=f"{self._service_id}-{request.request_id}")
-                    self._pending_tasks.add(task)
-                    task.add_done_callback(self._pending_tasks.discard)
+                if message_type == b"call_from_router" and request_json:
+                    request = json.loads(request_json)
+                    if request.get("type") == "request":
+                        task = asyncio.create_task(self._process_request(target_client_id, request), name=f"{self._service_id}-{request.get('request_id')}")
+                        self._pending_tasks.add(task)
+                        task.add_done_callback(self._pending_tasks.discard)
 
                 elif message_type == b"heartbeat_ack":
                     # 更新最后成功心跳时间
@@ -426,7 +423,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             except Exception as e:
                 self._logger.error(f"<{self._service_id}> Message processing error: {e}", exc_info=True)
 
-    async def _process_request(self, target_client_id: bytes, request: RequestBlock):
+    async def _process_request(self, target_client_id: bytes, request: dict):
         """处理单个请求"""
         self._logger.info(f"<{self._service_id}> DEALER Processing request: {request}")
         if self._current_load >= self._max_concurrent:
@@ -453,7 +450,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                 
                 try:
                     # 检查方法是否注册过
-                    func_name = request.func_name.split('.')[-1]
+                    func_name = request.get("func_name", "").split('.')[-1]
                     if func_name in self._handlers:
                         handler = self._handlers[func_name]['handler']
                         handler_info = self._registry[func_name]
@@ -462,51 +459,64 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                     else:
                         await self._send_error(
                             target_client_id,
-                            f"Method {request.func_name} not found"
+                            f"Method {request.get('func_name')} not found"
                         )
                         return
 
                     try:
                         if is_stream:
-                            self._logger.info(f"<{self._service_id}> Streaming response for {request.func_name}")
+                            self._logger.info(f"<{self._service_id}> Streaming response for {request.get('func_name')}")
                             # 处理流式响应
-                            async for chunk in handler(*request.args, **request.kwargs):
-                                # 使用工厂方法创建数据块
-                                if isinstance(chunk, StreamingBlock):
-                                    block = chunk
-                                    block.request_id = request.request_id
-                                else:
-                                    block= chunk
+                            async for chunk in handler(*request.get("args", []), **request.get("kwargs", {})):
+                                # 将Pydantic模型转换为字典
+                                if isinstance(chunk, BaseModel):
+                                    chunk = chunk.model_dump()
+                                
+                                # 创建流式响应消息
+                                message = {
+                                    "type": "streaming",
+                                    "request_id": request.get("request_id"),
+                                    "data": chunk
+                                }
 
                                 await self._socket.send_multipart([
                                     b"reply_from_dealer",
                                     target_client_id,
-                                    serialize_message(block)
+                                    json.dumps(message).encode()
                                 ])
                             
                             # 发送结束标记
-                            end_block = EndBlock(
-                                request_id=request.request_id
-                            )
+                            end_message = {
+                                "type": "end",
+                                "request_id": request.get("request_id")
+                            }
                             await self._socket.send_multipart([
                                 b"reply_from_dealer",
                                 target_client_id,
-                                serialize_message(end_block)
+                                json.dumps(end_message).encode()
                             ])
                         else:
                             # 处理普通响应
                             if is_coroutine:
-                                result = await handler(*request.args, **request.kwargs)
+                                result = await handler(*request.get("args", []), **request.get("kwargs", {}))
                             else:
-                                result = handler(*request.args, **request.kwargs)
-                            reply = ReplyBlock(
-                                request_id=request.request_id,
-                                result=result
-                            )
+                                result = handler(*request.get("args", []), **request.get("kwargs", {}))
+
+                            # 将Pydantic模型转换为字典
+                            if isinstance(result, BaseModel):
+                                result = result.model_dump()
+                                
+                            # 创建响应消息
+                            reply = {
+                                "type": "reply",
+                                "request_id": request.get("request_id"),
+                                "result": result
+                            }
+                                
                             await self._socket.send_multipart([
                                 b"reply_from_dealer",
                                 target_client_id,
-                                serialize_message(reply)
+                                json.dumps(reply).encode()
                             ])
                     except zmq.ZMQError as e:
                         self._logger.error(f"<{self._service_id}> DEALER ZMQError: {e}")
@@ -528,13 +538,14 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
 
     async def _send_error(self, target_client_id: bytes, error_msg: str):
         """发送错误响应"""
-        error = ErrorBlock(
-            error=error_msg
-        )
+        error = {
+            "type": "error",
+            "error": error_msg
+        }
         await self._socket.send_multipart([
             b"reply_from_dealer",
             target_client_id,
-            serialize_message(error)
+            json.dumps(error).encode()
         ])
 
     async def _heartbeat_loop(self):

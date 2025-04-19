@@ -7,7 +7,6 @@ import logging
 import uuid
 from datetime import datetime
 
-from .utils import serialize
 from .enum import BlockType, ReplyState, RequestStep
 
 logger = logging.getLogger(__name__)
@@ -21,7 +20,6 @@ class ZmqServiceState(Enum):
     STOPPED = 4    # 已停止
 
 
-@serialize
 class BaseBlock(BaseModel):
     """基础数据块"""
     request_id: str = Field(default="")
@@ -32,35 +30,29 @@ class BaseBlock(BaseModel):
 
     model_config = ConfigDict(use_enum_values=True)
 
-@serialize
 class ReplyBlock(BaseBlock):
     """响应块"""
     state: ReplyState = Field(default=ReplyState.SUCCESS)
     result: Any = None
 
-@serialize
 class ReplyAcceptedBlock(ReplyBlock):
     """响应块"""
     state: ReplyState = ReplyState.ACCEPTED
     subscribe_address: Union[str, None]
 
-@serialize
 class ReplyReadyBlock(ReplyBlock):
     """响应块"""
     state: ReplyState = ReplyState.READY
 
-@serialize
 class ReplyProcessingBlock(ReplyBlock):
     """响应块"""
     state: ReplyState = ReplyState.PROCESSING
 
-@serialize
 class ReplyErrorBlock(ReplyBlock):
     """响应块"""
     state: ReplyState = ReplyState.ERROR
     error: str
 
-@serialize
 class RequestBlock(BaseBlock):
     """请求块"""
     request_step: RequestStep
@@ -68,7 +60,6 @@ class RequestBlock(BaseBlock):
     args: List[Any] = []
     kwargs: Dict[str, Any] = {}
 
-@serialize
 class StreamingBlock(BaseBlock):
     """流式数据块基类"""
     block_type: BlockType
@@ -101,7 +92,6 @@ class StreamingBlock(BaseBlock):
 
         return cls(block_type=block_type, **kwargs)
 
-@serialize
 class ProgressBlock(StreamingBlock):
     """进度块"""
     block_type: BlockType = BlockType.PROGRESS
@@ -119,7 +109,6 @@ class ProgressBlock(StreamingBlock):
             "message": self.message
         }
 
-@serialize
 class StartBlock(StreamingBlock):
     """开始块"""
     block_type: BlockType = BlockType.START
@@ -128,7 +117,6 @@ class StartBlock(StreamingBlock):
     def content(self) -> None:
         return None
 
-@serialize
 class EndBlock(StreamingBlock):
     """结束块"""
     block_type: BlockType = BlockType.END
@@ -137,7 +125,6 @@ class EndBlock(StreamingBlock):
     def content(self) -> None:
         return None
 
-@serialize
 class ErrorBlock(StreamingBlock):
     """错误块"""
     block_type: BlockType = BlockType.ERROR
