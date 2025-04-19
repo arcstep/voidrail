@@ -6,6 +6,20 @@ VoidRail 是一个基于 ZeroMQ 的轻量级微服务通信框架，采用 ROUTE
 
 VoidRail 的主要目标是实现 CPU/GPU 密集型计算的分布式部署，尤其是与主服务的 fastapi 搭配使用，因此推荐使用默认的 FIFO 模式。
 
+## 安装
+
+使用 pip 安装：
+
+```bash
+pip install voidrail
+```
+
+或使用 poetry 安装：
+
+```bash
+poetry add voidrail
+```
+
 ## 核心组件
 
 VoidRail 由三个主要组件构成：
@@ -30,14 +44,15 @@ ClientDealer --请求--> ServiceRouter --转发--> ServiceDealer
 - 支持服务监控、健康检查和心跳机制
 - 支持同步/异步方法和流式响应
 - 使用 JSON 做数据交换（如果有必要，实际上你可以用其他语言来实现队列访问或提供服务）
+- 支持 API 密钥认证，提升服务安全性
 
 ## 快速入门
 
 ### 1. 创建 Router（核心交换服务）
 
 ```python
-from voidrail.mq.service import ServiceRouter
-from voidrail.mq.service.router import RouterMode
+from voidrail import ServiceRouter
+from voidrail import RouterMode
 
 # 创建并启动路由器
 router = ServiceRouter(
@@ -51,7 +66,7 @@ await router.start()
 ### 2. 实现 Dealer（服务端）
 
 ```python
-from voidrail.mq.service import ServiceDealer, service_method
+from voidrail import ServiceDealer, service_method
 
 class EchoService(ServiceDealer):
     # 这些方法不需要全部定义，而是根据需要选择一个即可
@@ -83,7 +98,7 @@ await service.start()
 ### 3. 使用 Client（客户端）
 
 ```python
-from voidrail.mq.service import ClientDealer
+from voidrail import ClientDealer
 
 # 创建客户端
 client = ClientDealer(router_address="tcp://127.0.0.1:5555")
@@ -99,6 +114,69 @@ print(f"结果: {result}")
 # 使用流式响应
 async for number in client.stream("EchoService.stream_numbers", 0, 5):
     print(f"收到数字: {number}")
+```
+
+## 认证
+
+VoidRail 提供了 API 密钥认证机制，以提高服务的安全性。
+
+### 1. 启用认证
+
+在 Router 中启用认证：
+
+```python
+from voidrail import ServiceRouter, ApiKeyManager
+
+# 生成密钥
+dealer_key = ApiKeyManager.generate_key(prefix="dealer")
+client_key = ApiKeyManager.generate_key(prefix="client")
+
+# 创建带认证的 Router
+router = ServiceRouter(
+    address="tcp://127.0.0.1:5555",
+    require_auth=True,
+    dealer_api_keys=[dealer_key],  # 服务端密钥
+    client_api_keys=[client_key]   # 客户端密钥
+)
+await router.start()
+```
+
+你也可以自己手工设定密钥，服务端不会对密钥做格式检查，但生成的密钥格式可能更符合最佳实践。
+
+### 2. 配置服务认证
+
+```python
+# 创建带认证的服务
+service = EchoService(
+    router_address="tcp://127.0.0.1:5555",
+    api_key=dealer_key  # 服务必须提供有效的 dealer_key
+)
+await service.start()
+```
+
+### 3. 配置客户端认证
+
+```python
+# 创建带认证的客户端
+client = ClientDealer(
+    router_address="tcp://127.0.0.1:5555",
+    api_key=client_key  # 客户端必须提供有效的 client_key
+)
+await client.connect()
+```
+
+### 4. 通过环境变量配置认证
+
+也可以通过环境变量设置认证：
+
+```bash
+# Router 环境变量
+export VOIDRAIL_REQUIRE_AUTH=true
+export VOIDRAIL_DEALER_API_KEYS=dealer_key1,dealer_key2
+export VOIDRAIL_CLIENT_API_KEYS=client_key1,client_key2
+
+# 客户端或服务的环境变量
+export VOIDRAIL_API_KEY=your_api_key
 ```
 
 ## 分布式部署
@@ -160,12 +238,26 @@ for method, status in queues.items():
 
 ## 关键概念详解
 
-### 路由模式
+### ROUTER-DEALER 通信架构
+
+- **ROUTER** ZMQ 的核心概念之一，可以简单理解为路由服务总线，一般可以将其放在你的主服务中启动
+- **DEALER** ZMQ 的核心概念之一，可以简单理解为需要你自定义的服务处理端，在分布式架构中可以根据CPU核心情况独立启动
+- **CLIENT** 在 VoidRail 框架中 CLIENT 是一种特殊的 DEALER，一般也是在主服务中启动
+
+实际上该框架使用了典型的 `ROUTER-DEALER` 通信架构来完成跨服异步双向通信。
+
+该架构需要启动一个 ROUTER 端作为路由中心，由至少一个 DEALER 端负责处理，然后就可以由 CLIENT 端调用，组成完整服务了。
+
+### 服务派发模式
+
+路由策略，也就是服务派发策略，由 router_mode 参数决定。
 
 - **FIFO 模式**：保证同一个方法的请求按顺序处理，适合需要严格顺序的应用
 - **负载均衡模式**：基于服务当前负载分配请求，适合追求最高吞吐量的应用
 
 ### 服务方法类型
+
+你至少应该对 Python 的异步行为有一定了解，不过实现时你也可以将服务方法定义为同步的。
 
 - **同步方法**：直接返回结果，适合简单计算
 - **异步方法**：使用 `async/await`，适合 I/O 密集型操作
@@ -184,10 +276,11 @@ for method, status in queues.items():
 ```python
 ServiceRouter(
     address: str,                          # 监听地址
-    context: Optional[zmq.Context] = None, # ZMQ 上下文
     heartbeat_timeout: float = 30.0,       # 心跳超时（秒）
     router_mode: RouterMode = RouterMode.FIFO,  # 路由模式
-    hwm: int = 1000,                       # 高水位标记，这是 ZMQ 核心概念之一，请查阅官方文档
+    require_auth: bool = None,           # 是否要求认证
+    dealer_api_keys: List[str] = None,   # 允许的 DEALER 端 API 密钥列表
+    client_api_keys: List[str] = None,   # 允许的 CLIENT 端 API 密钥列表
 )
 ```
 
