@@ -68,6 +68,101 @@ class ClientDealer:
         """发现可用的服务节点"""
         return await self.invoke("clusters", timeout=timeout)
 
+    async def get_queue_status(self, timeout: Optional[float] = None) -> Dict[str, Dict]:
+        """获取当前所有方法的队列状态
+        
+        返回值是一个字典，每个方法名作为键，值包含:
+        - queue_length: 队列中等待处理的请求数
+        - available_services: 可用且空闲的服务实例数
+        - busy_services: 可用但正忙的服务实例数
+        """
+        if timeout is None:
+            timeout = self._timeout
+
+        if not self._connected:
+            await self.connect()
+        
+        try:
+            self._logger.info("发送queue_status请求")
+            await self._socket.send_multipart([
+                b"queue_status",
+                b""
+            ])
+
+            multipart = await asyncio.wait_for(
+                self._socket.recv_multipart(),
+                timeout=timeout
+            )
+            
+            self._logger.info(f"原始响应 (multipart长度={len(multipart)}): {multipart}")
+
+            response_data = multipart[-1].decode()
+            self._logger.info(f"响应文本: {response_data}")
+            
+            try:
+                response = json.loads(response_data)
+                self._logger.info(f"解析后的响应: {response}")
+            except json.JSONDecodeError as e:
+                self._logger.error(f"JSON解析错误: {e}, 原始数据: {response_data}")
+                return {}
+                
+            if response.get("type") == "reply":
+                return response.get("result", {})
+            elif response.get("type") == "error":
+                raise RuntimeError(response.get("error"))
+            else:
+                raise ValueError(f"Unexpected response type: {response.get('type')}")
+
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"[{self._router_address}] Get queue status timeout")
+        except Exception as e:
+            self._logger.error(f"[{self._router_address}] Get queue status error: {e}")
+            raise
+
+    async def get_router_info(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """获取路由器的配置信息
+        
+        返回值包含:
+        - mode: 路由器模式 (fifo或load_balance)
+        - address: 路由器地址
+        - heartbeat_timeout: 心跳超时时间
+        - active_services: 当前活跃服务数量
+        - total_services: 总服务数量
+        - queue_stats: 当前各方法队列长度
+        """
+        if timeout is None:
+            timeout = self._timeout
+
+        if not self._connected:
+            await self.connect()
+        
+        try:
+            await self._socket.send_multipart([
+                b"router_info",
+                b""
+            ])
+
+            multipart = await asyncio.wait_for(
+                self._socket.recv_multipart(),
+                timeout=timeout
+            )
+
+            response_data = multipart[-1].decode()
+            response = json.loads(response_data)
+            
+            if response.get("type") == "reply":
+                return response.get("result", {})
+            elif response.get("type") == "error":
+                raise RuntimeError(response.get("error"))
+            else:
+                raise ValueError(f"Unexpected response type: {response.get('type')}")
+
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"[{self._router_address}] Get router info timeout")
+        except Exception as e:
+            self._logger.error(f"[{self._router_address}] Get router info error: {e}")
+            raise
+
     async def invoke(self, method: str, *args, timeout: Optional[float] = None, **kwargs) -> Dict[str, Dict]:
         """直接返回结果的调用
         内部方法不会包含分组所需的间隔句点。

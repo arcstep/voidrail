@@ -418,6 +418,65 @@ class ServiceRouter:
                             if method_name in self._services[from_id].methods and len(self._method_queues[method_name]) > 0:
                                 await self._process_fifo_queue(method_name)
 
+                elif message_type == "queue_status":
+                    # 收集队列状态信息
+                    queue_stats = {}
+                    for method_name, queue in self._method_queues.items():
+                        queue_stats[method_name] = {
+                            "queue_length": len(queue),
+                            "available_services": len([
+                                s for s in self._services.values()
+                                if method_name in s.methods and 
+                                s.state == ServiceState.ACTIVE and
+                                self._dealer_processing.get(s.service_id, 0) == 0
+                            ]),
+                            "busy_services": len([
+                                s for s in self._services.values()
+                                if method_name in s.methods and 
+                                s.state == ServiceState.ACTIVE and
+                                self._dealer_processing.get(s.service_id, 0) > 0
+                            ])
+                        }
+                    
+                    self._logger.info(f"Handling queue_status request, response: {queue_stats}")
+                    
+                    response = {
+                        "type": "reply",
+                        "request_id": str(uuid.uuid4()),
+                        "result": queue_stats
+                    }
+                    
+                    await self._socket.send_multipart([
+                        from_id_bytes,
+                        b"queue_status_ack",  # 消息类型标识
+                        json.dumps(response).encode()
+                    ])
+
+                elif message_type == "router_info":
+                    # 提供路由器的配置信息
+                    router_info = {
+                        "mode": self._router_mode.value,  # FIFO或LOAD_BALANCE
+                        "address": self._address,
+                        "heartbeat_timeout": self._HEARTBEAT_TIMEOUT,
+                        "active_services": len([s for s in self._services.values() if s.state == ServiceState.ACTIVE]),
+                        "total_services": len(self._services),
+                        "queue_stats": {
+                            method: len(queue) for method, queue in self._method_queues.items()
+                        }
+                    }
+                    
+                    response = {
+                        "type": "reply",
+                        "request_id": str(uuid.uuid4()),
+                        "result": router_info
+                    }
+                    
+                    await self._socket.send_multipart([
+                        from_id_bytes,
+                        b"router_info_ack",
+                        json.dumps(response).encode()
+                    ])
+
                 else:
                     await self._send_error(from_id_bytes, f"Unknown message type: {message_type}")
 
