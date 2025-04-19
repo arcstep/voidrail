@@ -1,9 +1,11 @@
 import pytest
+import pytest_asyncio
 import asyncio
 import zmq.asyncio
 import logging
 from voidrail.mq.service import ServiceRouter, ServiceDealer, ClientDealer, service_method
 from voidrail.mq.schemas import StreamingBlock, BlockType
+from voidrail.mq.service.dealer import DealerState
 
 logger = logging.getLogger(__name__)
 
@@ -15,13 +17,6 @@ def setup_logging(caplog):
         handler.setLevel(logging.DEBUG)
     # 设置 caplog 捕获级别
     caplog.set_level(logging.DEBUG)
-
-@pytest.fixture()
-def event_loop():
-    """创建事件循环"""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
 
 @pytest.fixture()
 def zmq_context():
@@ -48,13 +43,12 @@ def test_config():
         'dealer_heartbeat': 0.25,    # Dealer 心跳发送间隔
     }
 
-@pytest.fixture()
+@pytest_asyncio.fixture
 async def router(router_address, zmq_context, test_config):
     """创建并启动路由器"""
     router = ServiceRouter(
         router_address, 
         context=zmq_context,
-        heartbeat_interval=test_config['heartbeat_interval'],
         heartbeat_timeout=test_config['heartbeat_timeout']
     )
     await router.start()
@@ -64,7 +58,7 @@ async def router(router_address, zmq_context, test_config):
     await asyncio.sleep(0.5)
     await router.stop()
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def service(router, router_address, zmq_context, test_config):
     """创建并启动服务"""
     service = EchoService(
@@ -78,7 +72,7 @@ async def service(router, router_address, zmq_context, test_config):
     await service.stop()
     await asyncio.sleep(0.1)  # 给 router 一点时间处理关闭确认
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def streaming_service(router, router_address, zmq_context, test_config):
     """创建并启动服务"""
     service = StreamingService(
@@ -92,11 +86,11 @@ async def streaming_service(router, router_address, zmq_context, test_config):
     await service.stop()
     await asyncio.sleep(0.1)  # 给 router 一点时间处理关闭确认
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def client(router, service, router_address, zmq_context):
     """创建客户端"""
     # 确保服务已经注册
-    assert service._running, "Service not running"
+    assert service._state == DealerState.RUNNING, "Service not running"
     
     client = ClientDealer(router_address, context=zmq_context, timeout=2.0)
     try:
@@ -104,11 +98,11 @@ async def client(router, service, router_address, zmq_context):
     finally:
         await client.close()
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def streaming_client(router, streaming_service, router_address, zmq_context):
     """创建客户端"""
     # 确保服务已经注册
-    assert streaming_service._running, "Service not running"
+    assert streaming_service._state == DealerState.RUNNING, "Service not running"
     
     client = ClientDealer(router_address, context=zmq_context, timeout=2.0)
     try:

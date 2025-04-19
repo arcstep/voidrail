@@ -17,13 +17,6 @@ def setup_logging(caplog):
     # 设置 caplog 捕获级别
     caplog.set_level(logging.INFO)
 
-# @pytest.fixture()
-# def event_loop():
-#     """创建事件循环"""
-#     loop = asyncio.new_event_loop()
-#     yield loop
-#     loop.close()
-
 @pytest.fixture()
 def zmq_context():
     """创建共享的 ZMQ Context"""

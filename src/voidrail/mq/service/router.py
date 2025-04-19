@@ -1,7 +1,8 @@
-from typing import Dict, Any, List, Optional, Union, Set
+from typing import Dict, Any, List, Optional, Union, Set, Deque
 from pydantic import BaseModel, Field
 from enum import Enum
 from time import time
+from collections import defaultdict, deque
 
 import zmq
 import zmq.asyncio
@@ -9,10 +10,14 @@ import asyncio
 import logging
 import json
 import uuid
-import async_timeout
 
 from ..schemas import ZmqServiceState, ReplyErrorBlock, RequestBlock, ReplyState, ReplyBlock, ErrorBlock
 from ..utils import serialize_message, deserialize_message
+
+class RouterMode(str, Enum):
+    """路由器模式枚举"""
+    LOAD_BALANCE = "load_balance"  # 默认负载均衡模式
+    FIFO = "fifo"                  # 先进先出模式
 
 class ServiceState(str, Enum):
     """服务状态枚举"""
@@ -64,12 +69,13 @@ class ServiceRouter:
         address: str, 
         context: Optional[zmq.asyncio.Context] = None,
         heartbeat_timeout: float = 30.0,     # 心跳超时时间（秒）
-        monitor_interval: float = 1.0,      # 自监控间隔时间（秒）
+        router_mode: RouterMode = RouterMode.FIFO,  # 默认为FIFO模式,
+        hwm: int = 1000,
     ):
         self._context = context or zmq.asyncio.Context()
         self._address = address
         self._socket = self._context.socket(zmq.ROUTER)
-        self._socket.set_hwm(1000)  # 设置高水位标记
+        self._socket.set_hwm(hwm)  # 设置高水位标记
         self._running = False
         self._services: Dict[str, ServiceInfo] = {}
         self._logger = logging.getLogger(__name__)
@@ -92,6 +98,13 @@ class ServiceRouter:
 
         # 服务健康检查任务
         self._service_health_check_task = None
+        
+        # 路由模式
+        self._router_mode = router_mode
+        
+        # FIFO模式相关
+        self._method_queues = defaultdict(deque)  # 为每个方法创建请求队列
+        self._dealer_processing = defaultdict(int)  # 记录每个DEALER端当前处理的请求数
 
     async def _force_reconnect(self):
         """强制完全重置连接"""
@@ -317,29 +330,43 @@ class ServiceRouter:
                         
                     service_name = multipart[2].decode()
                     
-                    target_service = self._select_best_service(service_name)
-                    if target_service and target_service.state == ServiceState.ACTIVE:
-                        target_service.accept_request()
-                        self._services[target_service.service_id].accept_request()
-                        service_dealer_id = target_service.service_id.encode()
-                        await self._socket.send_multipart([
-                            service_dealer_id,
-                            b"call_from_router",
-                            from_id_bytes,
-                            *multipart[2:]
-                        ])
+                    # FIFO模式: 将请求加入队列并尝试处理
+                    if self._router_mode == RouterMode.FIFO:
+                        # 将请求加入队列
+                        queue_item = {
+                            'from_id_bytes': from_id_bytes,
+                            'multipart': multipart[2:],
+                        }
+                        self._method_queues[service_name].append(queue_item)
+                        self._logger.info(f"FIFO: 已将请求加入 {service_name} 队列，当前长度: {len(self._method_queues[service_name])}")
+                        
+                        # 尝试处理队列中的请求
+                        await self._process_fifo_queue(service_name)
                     else:
-                        error_msg = f"No available service for method {service_name}"
-                        self._logger.error(f"{error_msg}")
-                        error = ReplyErrorBlock(
-                            request_id=str(uuid.uuid4()),
-                            error=error_msg
-                        )
-                        await self._socket.send_multipart([
-                            from_id_bytes,
-                            b"reply_from_router",
-                            serialize_message(error)
-                        ])
+                        # 原有负载均衡模式
+                        target_service = self._select_best_service(service_name)
+                        if target_service and target_service.state == ServiceState.ACTIVE:
+                            target_service.accept_request()
+                            self._services[target_service.service_id].accept_request()
+                            service_dealer_id = target_service.service_id.encode()
+                            await self._socket.send_multipart([
+                                service_dealer_id,
+                                b"call_from_router",
+                                from_id_bytes,
+                                *multipart[2:]
+                            ])
+                        else:
+                            error_msg = f"No available service for method {service_name}"
+                            self._logger.error(f"{error_msg}")
+                            error = ReplyErrorBlock(
+                                request_id=str(uuid.uuid4()),
+                                error=error_msg
+                            )
+                            await self._socket.send_multipart([
+                                from_id_bytes,
+                                b"reply_from_router",
+                                serialize_message(error)
+                            ])
 
                 elif message_type in ["overload", "resume", "shutdown"]:
                     # 处理服务状态变更消息
@@ -372,7 +399,21 @@ class ServiceRouter:
                         b"reply_from_router",
                         response_data
                     ])
+                    
+                    # 更新服务状态
                     self._services[from_id].complete_request()
+                    
+                    # FIFO模式: 处理完成后更新状态并尝试处理下一个请求
+                    if self._router_mode == RouterMode.FIFO:
+                        # 减少处理计数
+                        self._dealer_processing[from_id] -= 1
+                        if self._dealer_processing[from_id] < 0:
+                            self._dealer_processing[from_id] = 0
+                            
+                        # 处理所有队列中的请求
+                        for method_name in self._method_queues.keys():
+                            if method_name in self._services[from_id].methods and len(self._method_queues[method_name]) > 0:
+                                await self._process_fifo_queue(method_name)
 
                 else:
                     await self._send_error(from_id_bytes, f"Unknown message type: {message_type}")
@@ -381,8 +422,68 @@ class ServiceRouter:
                 self._logger.error(f"Router error: {e}", exc_info=True)
                 await self._send_error(from_id_bytes, f"Service Router Error")
 
+    async def _process_fifo_queue(self, method_name: str):
+        """处理FIFO模式下的请求队列"""
+        # 如果队列为空则不处理
+        if not self._method_queues[method_name]:
+            return
+            
+        # 尝试处理队列中的所有请求，直到没有可用的服务或队列为空
+        while self._method_queues[method_name]:
+            # 获取一个空闲的服务
+            target_service = self._select_best_service_fifo(method_name)
+            if not target_service:
+                # 没有可用服务，等待下次有服务完成任务后再处理
+                self._logger.info(f"FIFO: 没有空闲的DEALER处理 {method_name} 队列中的请求，队列长度: {len(self._method_queues[method_name])}")
+                break
+                
+            # 弹出队列中的第一个请求
+            queue_item = self._method_queues[method_name].popleft()
+            from_id_bytes = queue_item['from_id_bytes']
+            service_dealer_id = target_service.service_id.encode()
+            
+            # 记录处理状态 - 增加DEALER处理计数
+            self._dealer_processing[target_service.service_id] += 1
+            
+            # 更新服务状态
+            target_service.accept_request()
+            self._services[target_service.service_id].accept_request()
+            
+            # 转发请求
+            await self._socket.send_multipart([
+                service_dealer_id,
+                b"call_from_router",
+                from_id_bytes,
+                *queue_item['multipart']
+            ])
+            
+            self._logger.info(f"FIFO: 已将 {method_name} 请求分配给 {target_service.service_id}，"
+                            f"队列剩余: {len(self._method_queues[method_name])}，"
+                            f"DEALER当前处理数: {self._dealer_processing[target_service.service_id]}")
+
+    def _select_best_service_fifo(self, method_name: str) -> Optional[ServiceInfo]:
+        """FIFO模式下选择最佳服务实例 - 优先选择空闲的服务"""
+        available_services = [
+            service for service in self._services.values()
+            if (method_name in service.methods and 
+                service.state == ServiceState.ACTIVE and
+                # 在FIFO模式下，只有当前没有处理任务的服务才能被选中
+                self._dealer_processing.get(service.service_id, 0) == 0)
+        ]
+        
+        if not available_services:
+            return None
+            
+        # 随机选择一个可用服务，防止总是选同一个
+        return available_services[0]
+
     def _select_best_service(self, method_name: str) -> Optional[ServiceInfo]:
         """选择最佳服务实例"""
+        # 根据路由模式选择不同的策略
+        if self._router_mode == RouterMode.FIFO:
+            return self._select_best_service_fifo(method_name)
+        
+        # 原有负载均衡模式
         available_services = [
             service for service in self._services.values()
             if (method_name in service.methods and 
