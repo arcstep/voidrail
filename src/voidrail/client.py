@@ -304,24 +304,41 @@ class ClientDealer:
                 )
 
         request_id = str(uuid.uuid4())
+        
+        # 处理参数，需要确保所有参数都是可序列化的
+        serializable_args = []
+        for arg in args:
+            # 只保留基本类型，复杂对象需要进行特殊处理
+            serializable_args.append(arg)
+        
+        serializable_kwargs = {}
+        for key, value in kwargs.items():
+            # 只保留基本类型，复杂对象需要进行特殊处理
+            serializable_kwargs[key] = value
+        
         request = {
             "type": "request",
             "request_id": request_id,
             "func_name": method,
             "request_step": "READY",
-            "args": args,
-            "kwargs": kwargs
+            "args": serializable_args,
+            "kwargs": serializable_kwargs
         }
 
+        self._logger.debug(f"Request payload: {request}")
+        
         if timeout is None:
             timeout = self._timeout
 
         try:
+            # 将请求转换为JSON
+            json_request = json.dumps(request)
+            
             # 发送请求
             await self._socket.send_multipart([
                 b"call_from_client",  # 添加消息类型
                 method.encode(),  # 服务名称
-                json.dumps(request).encode()  # 请求数据
+                json_request.encode()  # 请求数据
             ])
 
             # 接收响应流

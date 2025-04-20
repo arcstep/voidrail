@@ -4,7 +4,11 @@ import importlib
 import sys
 import json
 import logging
-from typing import List, Optional
+import multiprocessing
+import os
+import signal
+import time
+from typing import List, Optional, Dict, Any
 from pathlib import Path
 
 from .router import ServiceRouter, RouterMode
@@ -87,13 +91,16 @@ def router(host, port, mode, heartbeat, require_auth, dealer_keys, client_keys, 
 @click.option('--router-info', is_flag=True, help='显示路由器信息')
 @click.option('--queue-status', is_flag=True, help='显示队列状态')
 @click.option('--call', '-c', help='调用服务方法，格式: ServiceName.method')
-@click.option('--args', '-a', help='方法参数，使用JSON格式，例如: \'["Hello", "World"]\'')
+@click.option('--args', '-a', help='方法参数，使用JSON格式，例如: \'["Hello", "World"]\' 或 \'{"name": "World", "age": 30}\'')
 @click.option('--timeout', '-t', default=30.0, help='请求超时时间（秒）')
 @click.option('--api-key', help='API认证密钥')
-@click.option('--logger-level', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']), default='INFO', help='日志级别')
+@click.option('--logger-level', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']), default='WARNING', help='日志级别')
 def client(host, port, list, router_info, queue_status, call, args, timeout, api_key, logger_level):
     """VoidRail客户端命令行接口"""
     address = f"tcp://{host}:{port}"
+    
+    # 设置日志级别
+    logging.getLogger("voidrail").setLevel(getattr(logging, logger_level))
     
     async def run_client():
         client = ClientDealer(router_address=address, timeout=timeout, api_key=api_key, logger_level=logger_level)
@@ -148,24 +155,43 @@ def client(host, port, list, router_info, queue_status, call, args, timeout, api
             
             if call:
                 # 调用指定服务方法
-                if not args:
-                    args_list = []
-                else:
+                parsed_args = []
+                parsed_kwargs = {}
+                
+                if args:
                     try:
-                        args_list = json.loads(args)
-                        if not isinstance(args_list, list):
-                            args_list = [args_list]
+                        # 解析JSON参数
+                        json_data = json.loads(args)
+                        
+                        # 直接检查是否是字典类型
+                        if type(json_data) == dict:
+                            parsed_kwargs = json_data
+                            click.echo(f"使用关键字参数: {parsed_kwargs}")
+                        elif type(json_data) == list:
+                            parsed_args = json_data
+                            click.echo(f"使用位置参数: {parsed_args}")
+                        else:
+                            # 非列表或字典，作为单个位置参数处理
+                            parsed_args = [json_data]
+                            click.echo(f"使用单一值作为位置参数: {parsed_args}")
                     except json.JSONDecodeError:
                         # 非JSON格式，视为单个字符串参数
-                        args_list = [args]
+                        parsed_args = [args]
+                        click.echo(f"使用字符串作为位置参数: {parsed_args}")
                 
                 click.echo(f"调用: {call}")
-                click.echo(f"参数: {args_list}")
                 
                 try:
                     # 使用流式API调用服务方法
                     click.echo("响应:")
-                    async for response in client.stream(call, *args_list):
+                    # 先展示要发送的参数
+                    if parsed_kwargs:
+                        click.echo(f"将发送关键字参数: {parsed_kwargs}")
+                    else:
+                        click.echo(f"将发送位置参数: {parsed_args}")
+                        
+                    # 调用服务
+                    async for response in client.stream(call, *parsed_args, **parsed_kwargs):
                         click.echo(f"  {response}")
                 except Exception as e:
                     click.echo(f"调用出错: {e}", err=True)
@@ -187,14 +213,18 @@ def client(host, port, list, router_info, queue_status, call, args, timeout, api
 @click.option('--host', '-h', default='127.0.0.1', help='Router地址')
 @click.option('--port', '-p', default=5555, help='Router端口')
 @click.option('--module', '-m', required=True, help='包含ServiceDealer类的Python模块路径')
-@click.option('--class', 'class_name', required=True, help='ServiceDealer类名')
+@click.option('--class', 'class_names', required=True, multiple=True, help='ServiceDealer类名(可多次指定)')
+@click.option('--instances', '-n', default=1, help='每个类启动的实例数量')
 @click.option('--max-concurrent', default=100, help='最大并发请求数')
 @click.option('--heartbeat', default=0.5, help='心跳间隔（秒）')
 @click.option('--api-key', help='API认证密钥')
 @click.option('--logger-level', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']), default='INFO', help='日志级别')
-def dealer(host, port, module, class_name, max_concurrent, heartbeat, api_key, logger_level):
-    """启动VoidRail Dealer服务实例"""
+def dealer(host, port, module, class_names, instances, max_concurrent, heartbeat, api_key, logger_level):
+    """启动VoidRail Dealer服务实例(支持多进程)"""
     address = f"tcp://{host}:{port}"
+    
+    # 设置日志级别
+    logging.getLogger("voidrail").setLevel(getattr(logging, logger_level))
     
     try:
         # 添加当前目录到模块搜索路径
@@ -204,63 +234,166 @@ def dealer(host, port, module, class_name, max_concurrent, heartbeat, api_key, l
         click.echo(f"导入模块: {module}")
         dealer_module = importlib.import_module(module)
         
-        click.echo(f"加载类: {class_name}")
-        if not hasattr(dealer_module, class_name):
-            click.echo(f"错误: 模块 {module} 中未找到类 {class_name}", err=True)
-            available_classes = [name for name in dir(dealer_module) 
-                               if isinstance(getattr(dealer_module, name), type) 
-                               and issubclass(getattr(dealer_module, name), ServiceDealer)
-                               and getattr(dealer_module, name) != ServiceDealer]
+        # 获取所有可用的ServiceDealer子类
+        available_classes = {}
+        for name in dir(dealer_module):
+            attr = getattr(dealer_module, name)
+            if isinstance(attr, type) and issubclass(attr, ServiceDealer) and attr != ServiceDealer:
+                available_classes[name] = attr
+        
+        # 验证指定的类是否存在
+        dealer_classes = {}
+        for class_name in class_names:
+            if class_name not in available_classes:
+                click.echo(f"错误: 模块 {module} 中未找到类 {class_name}", err=True)
+                if available_classes:
+                    click.echo(f"可用的ServiceDealer类: {', '.join(available_classes.keys())}")
+                return
             
-            if available_classes:
-                click.echo(f"可用的ServiceDealer类: {', '.join(available_classes)}")
+            dealer_classes[class_name] = available_classes[class_name]
+        
+        # 检查是否至少有一个类
+        if not dealer_classes:
+            click.echo("错误: 未指定任何可用的ServiceDealer类", err=True)
             return
         
-        dealer_class = getattr(dealer_module, class_name)
+        # 为每个类的每个实例创建进程
+        processes = []
         
-        # 检查类是否是ServiceDealer的子类
-        if not issubclass(dealer_class, ServiceDealer):
-            click.echo(f"错误: {class_name} 不是 ServiceDealer 的子类", err=True)
-            return
+        # 生成子进程启动配置
+        process_configs = []
+        for class_name, dealer_class in dealer_classes.items():
+            for i in range(instances):
+                process_configs.append({
+                    "class_name": class_name,
+                    "dealer_class": dealer_class,
+                    "instance_id": i+1,
+                    "address": address,
+                    "max_concurrent": max_concurrent,
+                    "heartbeat": heartbeat,
+                    "api_key": api_key,
+                    "logger_level": logger_level
+                })
         
-        # 获取服务方法信息
-        service_methods = dealer_class._registry.keys()
-        click.echo(f"服务方法: {', '.join(service_methods)}")
+        # 显示启动信息
+        click.echo(f"将启动 {len(dealer_classes)} 个类型的Dealer服务，每个类型 {instances} 个实例，"
+                   f"共 {len(process_configs)} 个实例")
+        for config in process_configs:
+            click.echo(f"  - {config['class_name']} (实例 {config['instance_id']})")
+        
+        # 启动子进程
+        for config in process_configs:
+            p = multiprocessing.Process(
+                target=start_dealer_process,
+                args=(config,),
+                name=f"{config['class_name']}-{config['instance_id']}"
+            )
+            p.daemon = True
+            p.start()
+            processes.append(p)
+            click.echo(f"启动子进程: {p.name} (PID: {p.pid})")
+            # 稍微延迟启动，避免瞬时资源压力
+            time.sleep(0.1)
+        
+        click.echo(f"所有 {len(processes)} 个Dealer服务进程已启动")
+        click.echo("按Ctrl+C终止所有服务")
+        
+        # 主进程等待所有子进程
+        try:
+            # 保持运行直到中断
+            while any(p.is_alive() for p in processes):
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            click.echo("正在终止所有Dealer服务进程...")
+            # 终止所有子进程
+            for p in processes:
+                if p.is_alive():
+                    click.echo(f"终止进程: {p.name} (PID: {p.pid})")
+                    p.terminate()
+            
+            # 等待所有进程结束
+            for p in processes:
+                p.join(timeout=1.0)
+            
+            click.echo("所有Dealer服务进程已终止")
         
     except ImportError as e:
         click.echo(f"错误: 无法导入模块 {module}: {e}", err=True)
         return
-    
-    async def start_dealer():
-        service = dealer_class(
-            router_address=address,
-            max_concurrent=max_concurrent,
-            heartbeat_interval=heartbeat,
-            api_key=api_key,
-            logger_level=logger_level
+    except Exception as e:
+        click.echo(f"启动服务时发生错误: {e}", err=True)
+        return
+
+def start_dealer_process(config: Dict[str, Any]):
+    """在子进程中启动一个Dealer服务实例"""
+    try:
+        # 设置进程名称
+        process_name = f"{config['class_name']}-{config['instance_id']}"
+        
+        # 配置日志
+        logging.basicConfig(
+            level=getattr(logging, config['logger_level']),
+            format=f'%(asctime)s - %(name)s - {process_name}[%(process)d] - %(levelname)s - %(message)s'
         )
+        logger = logging.getLogger("voidrail.dealer")
+        logger.info(f"启动 {process_name} 服务进程")
         
-        await service.start()
-        click.echo(f"服务 {class_name} 已启动并连接到 {address}")
-        click.echo(f"服务ID: {service._service_id}")
-        click.echo(f"最大并发数: {max_concurrent}")
-        
-        try:
-            # 保持运行直到中断
-            while True:
-                await asyncio.sleep(1)
-        except KeyboardInterrupt:
-            click.echo("正在停止服务...")
-        finally:
-            await service.stop()
-            click.echo("服务已停止")
+        # 启动服务实例
+        asyncio.run(start_dealer_service(
+            dealer_class=config['dealer_class'],
+            class_name=config['class_name'],
+            address=config['address'],
+            max_concurrent=config['max_concurrent'],
+            heartbeat_interval=config['heartbeat'],
+            api_key=config['api_key'],
+            instance_id=config['instance_id'],
+            logger_level=config['logger_level']
+        ))
+    except Exception as e:
+        logger = logging.getLogger("voidrail.dealer")
+        logger.error(f"服务进程 {process_name} 发生错误: {e}")
+        raise
+
+async def start_dealer_service(dealer_class, class_name, address, max_concurrent, 
+                              heartbeat_interval, api_key, instance_id, logger_level):
+    """异步启动一个Dealer服务实例"""
+    # 创建服务实例
+    service = dealer_class(
+        router_address=address,
+        max_concurrent=max_concurrent,
+        heartbeat_interval=heartbeat_interval,
+        api_key=api_key,
+        logger_level=logger_level
+    )
+    
+    # 启动服务
+    await service.start()
+    logger = logging.getLogger("voidrail.dealer")
+    logger.info(f"服务 {class_name} (实例 {instance_id}) 已启动并连接到 {address}")
+    logger.info(f"服务ID: {service._service_id}")
+    logger.info(f"最大并发数: {max_concurrent}")
+    
+    # 设置信号处理
+    stop_event = asyncio.Event()
+    
+    def signal_handler():
+        logger.info(f"收到终止信号，准备停止服务 {class_name} (实例 {instance_id})")
+        stop_event.set()
+    
+    # 注册SIGINT和SIGTERM处理
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        asyncio.get_event_loop().add_signal_handler(
+            sig, signal_handler
+        )
     
     try:
-        asyncio.run(start_dealer())
-    except KeyboardInterrupt:
-        click.echo("服务已中断")
-    except Exception as e:
-        click.echo(f"服务运行错误: {e}", err=True)
+        # 等待终止信号
+        await stop_event.wait()
+    finally:
+        # 停止服务
+        logger.info(f"正在停止服务 {class_name} (实例 {instance_id})")
+        await service.stop()
+        logger.info(f"服务 {class_name} (实例 {instance_id}) 已停止")
 
 if __name__ == "__main__":
     cli() 

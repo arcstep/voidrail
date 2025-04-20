@@ -341,6 +341,57 @@ voidrail router --require-auth --dealer-keys dealer_key1 --client-keys client_ke
 voidrail router --generate-keys
 ```
 
+### 使用客户端工具
+
+```bash
+# 列出所有可用服务
+voidrail client --list
+
+# 查看路由器信息
+voidrail client --router-info
+
+# 查看队列状态
+voidrail client --queue-status
+
+# 传递参数的不同方式:
+
+# 1. 使用字符串参数（注意引号嵌套）
+voidrail client --call EchoService.hello --args '"Hello World"'
+
+# 2. 使用数字参数
+voidrail client --call MathService.square --args '42'
+
+# 3. 使用位置参数列表
+voidrail client --call MathService.add --args '[5, 3]'
+
+# 4. 使用关键字参数（最灵活的方式）
+voidrail client --call EchoService.greet --args '{"name":"John", "title":"Dr."}'
+
+# 5. 使用复杂的嵌套结构
+voidrail client --call DataService.process --args '{"config":{"max_items":100}, "filters":["active", "recent"]}'
+
+# 使用API密钥认证
+voidrail client --api-key your_client_key --list
+```
+
+### 常见参数传递问题和解决方法
+
+1. **如果使用单引号包裹JSON**（推荐）:
+   ```bash
+   voidrail client --call EchoService.hello --args '{"name":"John"}'
+   ```
+
+2. **如果使用双引号包裹JSON，需要转义内部引号**:
+   ```bash
+   voidrail client --call EchoService.hello --args "{\"name\":\"John\"}"
+   ```
+
+3. **传递单个字符串时，需要额外的引号层**:
+   ```bash
+   voidrail client --call EchoService.hello --args '"John"'  # 正确
+   voidrail client --call EchoService.hello --args 'John'    # 错误
+   ```
+
 ### 启动Dealer服务
 
 假设您有一个自定义服务类在 `myapp/services.py` 文件中：
@@ -354,9 +405,10 @@ class MyService(ServiceDealer):
         return f"Hello, {name}!"
 ```
 
-使用CLI启动此服务：
+#### 启动单个服务实例
 
 ```bash
+# 基本用法
 voidrail dealer --module myapp.services --class MyService
 
 # 指定连接参数
@@ -366,27 +418,28 @@ voidrail dealer --host 192.168.1.100 --port 5555 --module myapp.services --class
 voidrail dealer --api-key your_dealer_key --module myapp.services --class MyService
 ```
 
-### 使用客户端工具
+#### 启动多进程服务实例（优化CPU利用率）
 
 ```bash
-# 列出所有可用服务
-voidrail client --list
+# 为一个服务类启动多个实例（每个实例在独立进程中运行）
+voidrail dealer --module myapp.services --class MyService --instances 4
 
-# 查看路由器信息
-voidrail client --router-info
+# 启动多个不同服务类（每个类在独立进程中运行）
+voidrail dealer --module myapp.services --class MyService --class OtherService
 
-# 查看队列状态
-voidrail client --queue-status
+# 启动多个不同服务类，每个类多个实例
+voidrail dealer --module myapp.services --class MyService --class OtherService --instances 2
 
-# 调用服务方法
-voidrail client --call EchoService.echo --args "Hello World"
-
-# 调用带多个参数的方法
-voidrail client --call EchoService.add --args "[5, 3]"
-
-# 使用API密钥认证
-voidrail client --api-key your_client_key --list
+# 结合其他参数
+voidrail dealer --host 192.168.1.100 --port 5555 --module myapp.services \
+  --class MyService --class OtherService --instances 4 \
+  --max-concurrent 50 --api-key your_dealer_key
 ```
+
+多进程启动功能允许您：
+- 充分利用多核CPU资源
+- 在单台机器上轻松管理多个服务实例
+- 实现更高的服务吞吐量
 
 ## 最佳实践
 
