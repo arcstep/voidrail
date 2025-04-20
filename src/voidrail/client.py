@@ -15,12 +15,13 @@ class ClientDealer:
         router_address: str,
         context: Optional[zmq.asyncio.Context] = None,
         timeout: Optional[float] = None,
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        logger_level: int = logging.INFO,
     ):
         self._router_address = router_address
         self._timeout = timeout
         self._logger = logging.getLogger(__name__)
-        
+        self._logger.setLevel(logger_level)
         self._context = context or zmq.asyncio.Context.instance()
         self._socket = None
         self._lock = asyncio.Lock()

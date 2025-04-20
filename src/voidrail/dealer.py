@@ -132,12 +132,14 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         heartbeat_interval: float = 0.5,
         heartbeat_timeout: float = 5.0,
         service_id: str = None,
-        api_key: str = None     # 新增: API密钥
+        api_key: str = None,     # 新增: API密钥
+        logger_level: int = logging.INFO,
     ):
         self._router_address = router_address
         self._hwm = hwm
         self._max_concurrent = max_concurrent
         self._logger = logging.getLogger(__name__)
+        self._logger.setLevel(logger_level)
         self._service_name = service_name or self.__class__.__name__
 
         # 记录是否需要自行创建context

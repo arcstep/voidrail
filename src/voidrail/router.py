@@ -79,6 +79,7 @@ class ServiceRouter:
         require_auth: bool = None,           # 是否要求认证
         dealer_api_keys: List[str] = None,   # DEALER 端 API 密钥列表
         client_api_keys: List[str] = None,   # CLIENT 端 API 密钥列表
+        logger_level: int = logging.INFO,
     ):
         self._context = context or zmq.asyncio.Context()
         self._address = address
@@ -88,6 +89,7 @@ class ServiceRouter:
         self._running = False
         self._services: Dict[str, ServiceInfo] = {}
         self._logger = logging.getLogger(__name__)
+        self._logger.setLevel(logger_level)
         
         # 可配置的超时参数
         self._HEARTBEAT_TIMEOUT = heartbeat_timeout

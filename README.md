@@ -324,6 +324,70 @@ ClientDealer(
 - `get_router_info()`: 获取路由器信息
 - `get_queue_status()`: 获取队列状态
 
+## 命令行工具
+
+VoidRail提供了便捷的命令行工具，无需编写代码即可启动和管理组件。
+
+### 启动Router服务
+
+```bash
+# 基本用法
+voidrail router --host 0.0.0.0 --port 5555
+
+# 启用认证
+voidrail router --require-auth --dealer-keys dealer_key1 --client-keys client_key1
+
+# 生成API密钥
+voidrail router --generate-keys
+```
+
+### 启动Dealer服务
+
+假设您有一个自定义服务类在 `myapp/services.py` 文件中：
+
+```python
+from voidrail import ServiceDealer, service_method
+
+class MyService(ServiceDealer):
+    @service_method
+    async def hello(self, name: str) -> str:
+        return f"Hello, {name}!"
+```
+
+使用CLI启动此服务：
+
+```bash
+voidrail dealer --module myapp.services --class MyService
+
+# 指定连接参数
+voidrail dealer --host 192.168.1.100 --port 5555 --module myapp.services --class MyService
+
+# 使用API密钥认证
+voidrail dealer --api-key your_dealer_key --module myapp.services --class MyService
+```
+
+### 使用客户端工具
+
+```bash
+# 列出所有可用服务
+voidrail client --list
+
+# 查看路由器信息
+voidrail client --router-info
+
+# 查看队列状态
+voidrail client --queue-status
+
+# 调用服务方法
+voidrail client --call EchoService.echo --args "Hello World"
+
+# 调用带多个参数的方法
+voidrail client --call EchoService.add --args "[5, 3]"
+
+# 使用API密钥认证
+voidrail client --api-key your_client_key --list
+```
+
 ## 最佳实践
 
 1. **错误处理**：主动在服务方法中捕获异常，否则处理错误和异常信息会作为结果发送到客户端，这可能不够优雅
