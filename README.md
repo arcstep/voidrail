@@ -411,6 +411,9 @@ class MyService(ServiceDealer):
 # 基本用法
 voidrail dealer --module myapp.services --class MyService
 
+# 自动推断类名（当模块中只有一个ServiceDealer子类时）
+voidrail dealer --module myapp.services
+
 # 指定连接参数
 voidrail dealer --host 192.168.1.100 --port 5555 --module myapp.services --class MyService
 
@@ -423,6 +426,9 @@ voidrail dealer --api-key your_dealer_key --module myapp.services --class MyServ
 ```bash
 # 为一个服务类启动多个实例（每个实例在独立进程中运行）
 voidrail dealer --module myapp.services --class MyService --instances 4
+
+# 自动推断类名并启动多个实例（当模块中只有一个ServiceDealer子类时）
+voidrail dealer --module myapp.services --instances 4
 
 # 启动多个不同服务类（每个类在独立进程中运行）
 voidrail dealer --module myapp.services --class MyService --class OtherService

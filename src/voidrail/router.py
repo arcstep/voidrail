@@ -73,7 +73,7 @@ class ServiceRouter:
         self, 
         address: str, 
         context: Optional[zmq.asyncio.Context] = None,
-        heartbeat_timeout: float = 30.0,     # 心跳超时时间（秒）
+        heartbeat_timeout: float = 30.0, # 空闲状态超时时间（秒）
         router_mode: RouterMode = RouterMode.FIFO,  # 默认为FIFO模式
         hwm: int = 1000,
         require_auth: bool = None,           # 是否要求认证
@@ -91,8 +91,10 @@ class ServiceRouter:
         self._logger = logging.getLogger(__name__)
         self._logger.setLevel(logger_level)
         
-        # 可配置的超时参数
-        self._HEARTBEAT_TIMEOUT = heartbeat_timeout
+        # 添加不同状态的超时配置
+        self._IDLE_HEARTBEAT_TIMEOUT = heartbeat_timeout  # 默认超时(通常30秒)
+        self._BUSY_HEARTBEAT_TIMEOUT = self._IDLE_HEARTBEAT_TIMEOUT * 60  # 忙碌状态超时(60倍空闲超时)
+        self._MAX_BUSY_WITHOUT_HEARTBEAT = self._BUSY_HEARTBEAT_TIMEOUT * 2  # 忙碌状态超时(2倍空闲超时)
         
         # 状态管理
         self._state = RouterState.INIT
@@ -141,6 +143,20 @@ class ServiceRouter:
             self._logger.info(f"API密钥认证已启用 (dealer_keys={len(self._dealer_api_keys)}, client_keys={len(self._client_api_keys)})")
         else:
             self._logger.info("API密钥认证未启用")
+
+        # 添加以下全局统计信息
+        self._total_request_count = 0
+        self._total_response_count = 0
+        self._start_time = time()
+        
+        # 源地址跟踪
+        self._service_sources = {}
+        
+        # 最后一次服务清理时间
+        self._last_service_cleanup = time()
+
+        # 记录DEALER最后一次报告忙碌的时间
+        self._service_busy_since = {}  # service_id -> timestamp
 
     async def _force_reconnect(self):
         """强制完全重置连接"""
@@ -252,6 +268,26 @@ class ServiceRouter:
             f"{service_info.get('group', 'default')}.{name}": info 
             for name, info in service_info.get('methods', {}).items()
         }
+        
+        # 检查是否是服务重连
+        is_reconnect = service_id in self._services
+        
+        # 规范化服务地址格式
+        if 'remote_addr' in service_info:
+            remote_addr = service_info.get('remote_addr')
+            host_info = service_info.get('host_info', {})
+            
+            # 如果地址格式不正确（缺少PID等信息），尝试重新格式化
+            if ':' in remote_addr and '[' not in remote_addr:
+                ip_part = remote_addr.split(':')[0]
+                pid = host_info.get('pid', 'unknown')
+                uuid_part = service_id.split('-')[-1] if '-' in service_id else service_id[-8:]
+                remote_addr = f"{ip_part} [PID:{pid}, ID:{uuid_part}]"
+                service_info['remote_addr'] = remote_addr
+            
+            self._service_sources[service_id] = remote_addr
+            self._logger.debug(f"服务 {service_id} 的远程地址: {remote_addr}")
+        
         self._services[service_id] = ServiceInfo(
             service_id=service_id,
             group=service_info.get('group', 'default'),
@@ -261,13 +297,27 @@ class ServiceRouter:
             request_count=service_info.get('request_count', 0),
             reply_count=service_info.get('reply_count', 0)
         )
-        self._logger.info(f"Registered service: {service_id} with max_concurrent={max_concurrent}: {methods}")
+        
+        if is_reconnect:
+            self._logger.info(f"Reconnected service: {service_id} with max_concurrent={max_concurrent}")
+        else:
+            self._logger.info(f"Registered new service: {service_id} with max_concurrent={max_concurrent}")
+        
         return True
 
     def unregister_service(self, service_id: str):
         """注销服务"""
         if service_id in self._services:
+            # 从活跃服务中移除
             del self._services[service_id]
+            
+            # 清理相关资源
+            if service_id in self._dealer_processing:
+                del self._dealer_processing[service_id]
+            
+            if service_id in self._service_sources:
+                del self._service_sources[service_id]
+            
             self._logger.info(f"Unregistered service: {service_id}")
 
     async def _send_error(self, from_id: bytes, error: str):
@@ -359,6 +409,16 @@ class ServiceRouter:
                         
                     async with self._service_lock:  # 单独加锁
                         service_info = json.loads(multipart[2].decode())
+                        
+                        # 尝试从zmq获取远程地址信息
+                        try:
+                            # 这里使用zmq的get_last_endpoint或类似方法获取对等端地址
+                            # 如果不可用，设置一个默认值表示"未知来源"
+                            if 'remote_addr' not in service_info:
+                                service_info['remote_addr'] = f"客户端-{from_id[:8]}"
+                        except:
+                            pass
+                        
                         registration_success = self.register_service(from_id, service_info)
                         
                         if registration_success:
@@ -383,19 +443,28 @@ class ServiceRouter:
                         except:
                             pass
                     
-                    api_key = heartbeat_data.get("api_key", "")
-                    
-                    # 如果需要认证，则验证API密钥
-                    if self._require_auth and from_id not in self._services and not self._verify_dealer_api_key(api_key):
-                        await self._send_error(from_id_bytes, "Heartbeat authentication failed")
-                        continue
-                    
+                    # 如果心跳数据中包含处理中请求数
                     if from_id in self._services.keys():
-                        # 发送心跳确认消息 (已在上面更新了状态)
+                        service = self._services[from_id]
+                        
+                        # 更新处理负载信息
+                        current_load = heartbeat_data.get("processing_requests", 0)
+                        if current_load > 0:
+                            # 记录忙碌开始时间(如果之前非忙碌)
+                            if service.current_load == 0:
+                                self._service_busy_since[from_id] = time()
+                            service.current_load = current_load
+                        else:
+                            # 清除忙碌状态
+                            if from_id in self._service_busy_since:
+                                del self._service_busy_since[from_id]
+                            service.current_load = 0
+                        
+                        # 发送心跳确认
                         await self._socket.send_multipart([
-                            from_id_bytes,  # 目标服务的ID
-                            b"heartbeat_ack",  # 心跳确认类型
-                            b""  # 空负载
+                            from_id_bytes,
+                            b"heartbeat_ack",
+                            b""
                         ])
                     else:
                         # 未注册的服务发送心跳
@@ -458,6 +527,9 @@ class ServiceRouter:
                         continue
                         
                     service_name = multipart[2].decode()
+                    
+                    # 更新全局请求计数
+                    self._total_request_count += 1
                     
                     # FIFO模式: 将请求加入队列并尝试处理
                     if self._router_mode == RouterMode.FIFO:
@@ -522,6 +594,9 @@ class ServiceRouter:
                         
                     target_client_id = multipart[2]  # 目标客户端ID
                     response_data = multipart[3] if len(multipart) > 3 else b""
+                    
+                    # 更新全局响应计数
+                    self._total_response_count += 1
                     
                     # 直接转发响应给客户端
                     await self._socket.send_multipart([
@@ -590,16 +665,54 @@ class ServiceRouter:
                         await self._send_error(from_id_bytes, "Not authenticated")
                         continue
                         
-                    # 提供路由器的配置信息
+                    # 服务分组统计 - 按组和来源统计
+                    service_by_group = {}
+                    for service in self._services.values():
+                        if service.state == ServiceState.ACTIVE:
+                            group = service.group
+                            service_by_group.setdefault(group, {"count": 0, "sources": {}})
+                            service_by_group[group]["count"] += 1
+                            
+                            # 将服务源地址添加到分组统计中
+                            source = self._service_sources.get(service.service_id, "未知")
+                            service_by_group[group]["sources"].setdefault(source, 0)
+                            service_by_group[group]["sources"][source] += 1
+                    
+                    # 按源地址合并服务信息
+                    services_by_source = {}
+                    for service_id, source in self._service_sources.items():
+                        if service_id in self._services:
+                            service = self._services[service_id]
+                            
+                            # 跳过非活跃服务
+                            if service.state != ServiceState.ACTIVE:
+                                continue
+                                
+                            # 使用更有意义的键，包含组名
+                            source_key = f"{source} ({service.group})"
+                            if source_key not in services_by_source:
+                                services_by_source[source_key] = []
+                            services_by_source[source_key].append(service_id)
+                    
+                    # 改进的信息响应
                     router_info = {
-                        "mode": self._router_mode.value,  # FIFO或LOAD_BALANCE
+                        "mode": self._router_mode.value,
                         "address": self._address,
-                        "heartbeat_timeout": self._HEARTBEAT_TIMEOUT,
-                        "active_services": len([s for s in self._services.values() if s.state == ServiceState.ACTIVE]),
-                        "total_services": len(self._services),
-                        "queue_stats": {
-                            method: len(queue) for method, queue in self._method_queues.items()
-                        },
+                        "idle_heartbeat_timeout": self._IDLE_HEARTBEAT_TIMEOUT,
+                        "busy_heartbeat_timeout": self._BUSY_HEARTBEAT_TIMEOUT,
+                        "max_busy_without_heartbeat": self._MAX_BUSY_WITHOUT_HEARTBEAT,
+                        "active_services_count": len([s for s in self._services.values() if s.state == ServiceState.ACTIVE]),
+                        "busy_services_count": len([s for s in self._services.values() if s.state == ServiceState.ACTIVE and s.current_load > 0]),
+                        "idle_services_count": len([s for s in self._services.values() if s.state == ServiceState.ACTIVE and s.current_load == 0]),
+                        "inactive_services_count": len([s for s in self._services.values() if s.state == ServiceState.INACTIVE]),
+                        "total_services_count": len(self._services),
+                        "uptime": int(time() - self._start_time),
+                        "total_requests": self._total_request_count,
+                        "total_responses": self._total_response_count,
+                        "requests_in_process": sum(s.current_load for s in self._services.values() if s.state == ServiceState.ACTIVE),
+                        "requests_in_queue": sum(len(queue) for queue in self._method_queues.values()),
+                        "service_by_group": service_by_group,
+                        "service_sources": services_by_source,
                         "auth_required": self._require_auth
                     }
                     
@@ -704,24 +817,66 @@ class ServiceRouter:
         return min(available_services, key=lambda s: s.current_load)
 
     async def _check_service_health(self):
-        """检查服务健康状态"""
+        """检查服务健康状态 - 支持差异化超时"""
         self._logger.info(f"Dealer service health check handler started")
         while self._state == RouterState.RUNNING:
             current_time = time()
             
             # 检查服务心跳
             for service_id, service in list(self._services.items()):
-                if service.state != ServiceState.SHUTDOWN:  # 不检查已主动下线的服务
-                    if current_time - service.last_heartbeat > self._HEARTBEAT_TIMEOUT:
+                if service.state != ServiceState.SHUTDOWN:
+                    heartbeat_age = current_time - service.last_heartbeat
+                    
+                    # 根据服务状态确定超时时间
+                    if service.current_load > 0:
+                        # 忙碌服务使用宽松的超时时间
+                        timeout = self._BUSY_HEARTBEAT_TIMEOUT
+                        
+                        # 检查是否超过最大忙碌无心跳时间
+                        busy_time = current_time - self._service_busy_since.get(service_id, current_time)
+                        if busy_time > self._MAX_BUSY_WITHOUT_HEARTBEAT:
+                            self._logger.warning(
+                                f"Service {service_id} has been busy without fresh heartbeat for "
+                                f"{busy_time:.1f}s, forcing inactive state"
+                            )
+                            service.state = ServiceState.INACTIVE
+                            service.current_load = 0
+                            if service_id in self._service_busy_since:
+                                del self._service_busy_since[service_id]
+                    else:
+                        # 空闲服务使用严格的超时时间
+                        timeout = self._IDLE_HEARTBEAT_TIMEOUT
+                    
+                    # 检查心跳是否超时
+                    if heartbeat_age > timeout:
                         if service.state != ServiceState.INACTIVE:
                             service.state = ServiceState.INACTIVE
-                            # 服务变为不可用时记录日志
                             self._logger.warning(
                                 f"Service {service_id} marked as inactive: "
-                                f"last heartbeat was {current_time - service.last_heartbeat:.1f}s ago"
+                                f"last heartbeat was {heartbeat_age:.1f}s ago "
+                                f"(timeout: {timeout:.1f}s, busy: {service.current_load > 0})"
                             )
                             service.current_load = 0
-                    else:
-                        self._logger.debug(f"Service {service_id} is living!")
+                            
+                        # 如果是空闲服务且超时时间过长，直接删除
+                        if service.current_load == 0 and heartbeat_age > self._IDLE_HEARTBEAT_TIMEOUT * 3:
+                            self._logger.warning(f"Removing inactive service: {service_id}")
+                            self.unregister_service(service_id)
             
-            await asyncio.sleep(self._HEARTBEAT_TIMEOUT)
+            # 周期性清理无效服务和状态信息
+            if current_time - self._last_service_cleanup > 300:  # 每5分钟
+                self._last_service_cleanup = current_time
+                
+                # 清理服务源记录
+                invalid_sources = set(self._service_sources.keys()) - set(self._services.keys())
+                for invalid_id in invalid_sources:
+                    if invalid_id in self._service_sources:
+                        self._logger.warning(f"移除无效的服务源记录: {invalid_id}")
+                        del self._service_sources[invalid_id]
+                
+                # 清理忙碌时间记录
+                invalid_busy = set(self._service_busy_since.keys()) - set(self._services.keys())
+                for invalid_id in invalid_busy:
+                    del self._service_busy_since[invalid_id]
+            
+            await asyncio.sleep(self._IDLE_HEARTBEAT_TIMEOUT / 2)  # 检查间隔为标准超时的一半

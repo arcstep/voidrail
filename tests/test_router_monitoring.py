@@ -88,10 +88,12 @@ async def test_router_info_fifo(client_dealer):
     assert "mode" in router_info
     assert router_info["mode"] == "fifo"  # 确认是FIFO模式
     assert "address" in router_info
-    assert "heartbeat_timeout" in router_info
-    assert "active_services" in router_info
-    assert "total_services" in router_info
-    assert "queue_stats" in router_info
+    assert "idle_heartbeat_timeout" in router_info
+    assert "busy_heartbeat_timeout" in router_info
+    assert "max_busy_without_heartbeat" in router_info
+    assert "active_services_count" in router_info
+    assert "total_services_count" in router_info
+    assert "requests_in_queue" in router_info
     
     # 打印路由器信息
     logger.info(f"Router 信息: {router_info}")
@@ -106,9 +108,12 @@ async def test_router_info_load_balance(lb_client_dealer):
     assert "mode" in router_info
     assert router_info["mode"] == "load_balance"  # 确认是负载均衡模式
     assert "address" in router_info
-    assert "heartbeat_timeout" in router_info
-    assert "active_services" in router_info
-    assert "total_services" in router_info
+    assert "idle_heartbeat_timeout" in router_info
+    assert "busy_heartbeat_timeout" in router_info
+    assert "max_busy_without_heartbeat" in router_info
+    assert "active_services_count" in router_info
+    assert "total_services_count" in router_info
+    assert "requests_in_queue" in router_info
     
     # 打印路由器信息
     logger.info(f"Router 信息: {router_info}")

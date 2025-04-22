@@ -69,20 +69,44 @@ def router(host, port, mode, heartbeat, require_auth, dealer_keys, client_keys, 
         click.echo(f"模式: {mode}")
         click.echo(f"认证: {'已启用' if require_auth else '未启用'}")
         
+        # 设置信号处理和停止保护
+        stop_event = asyncio.Event()
+        
+        def signal_handler():
+            click.echo("收到终止信号，正在关闭Router...")
+            stop_event.set()
+            
+        # 注册信号处理器
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, signal_handler)
+        
         try:
-            # 保持运行直到中断
-            while True:
-                await asyncio.sleep(0.5)
-        except KeyboardInterrupt:
-            click.echo("正在关闭Router...")
+            # 等待终止信号
+            await stop_event.wait()
         finally:
-            await router.stop()
-            click.echo("Router已停止")
+            # 安全停止服务，带超时保护
+            click.echo("正在关闭Router...")
+            try:
+                # 设置停止超时
+                stop_task = asyncio.create_task(router.stop())
+                try:
+                    await asyncio.wait_for(stop_task, timeout=5.0)
+                    click.echo("Router已成功停止")
+                except asyncio.TimeoutError:
+                    click.echo("Router停止超时，可能有未完成的任务")
+            except Exception as e:
+                click.echo(f"Router停止过程中出错: {e}")
+                # 确保进程退出
+                sys.exit(1)
     
     try:
         asyncio.run(start_router())
     except KeyboardInterrupt:
+        # 这个异常应该已经被内部处理，这里是额外保护
         click.echo("已中断Router服务")
+    except Exception as e:
+        click.echo(f"Router发生严重错误: {e}")
 
 @cli.command()
 @click.option('--host', '-h', default='127.0.0.1', help='Router地址')
@@ -137,9 +161,53 @@ def client(host, port, list, router_info, queue_status, call, args, timeout, api
                 click.echo(f"  模式: {info.get('mode', '未知')}")
                 click.echo(f"  地址: {info.get('address', '未知')}")
                 click.echo(f"  心跳超时: {info.get('heartbeat_timeout', '未知')}秒")
-                click.echo(f"  活跃服务数: {info.get('active_services', 0)}")
-                click.echo(f"  总服务数: {info.get('total_services', 0)}")
+                click.echo(f"  运行时间: {format_uptime(info.get('uptime', 0))}")
                 click.echo(f"  认证要求: {info.get('auth_required', False)}")
+                
+                click.echo("\n服务状态:")
+                click.echo(f"  活跃服务: {info.get('active_services_count', 0)}")
+                click.echo(f"  - 忙碌服务: {info.get('busy_services_count', 0)}")
+                click.echo(f"  - 空闲服务: {info.get('idle_services_count', 0)}")
+                click.echo(f"  非活跃服务: {info.get('inactive_services_count', 0)}")
+                
+                click.echo("\n请求统计:")
+                click.echo(f"  累计处理请求: {info.get('total_requests', 0)}")
+                click.echo(f"  累计响应请求: {info.get('total_responses', 0)}")
+                click.echo(f"  正在处理请求: {info.get('requests_in_process', 0)}")
+                click.echo(f"  排队等待请求: {info.get('requests_in_queue', 0)}")
+                
+                if 'service_by_group' in info:
+                    click.echo("\n服务分组:")
+                    for group, group_info in info.get('service_by_group', {}).items():
+                        count = group_info.get("count", 0)
+                        click.echo(f"  {group}: {count}个实例")
+                        
+                        # 添加来源信息
+                        if "sources" in group_info:
+                            for source, source_count in group_info["sources"].items():
+                                click.echo(f"    - {source}: {source_count}个实例")
+                
+                if 'service_sources' in info and info.get('service_sources'):
+                    click.echo("\n服务来源详情:")
+                    for source_key, services in info.get('service_sources', {}).items():
+                        # 显示服务源及其管理的服务数量
+                        click.echo(f"  {source_key}: {len(services)}个实例")
+                        # 可选：显示每个服务的具体ID
+                        # 如果服务数量过多，可以限制显示前3个
+                        if len(services) <= 3:
+                            for service_id in services:
+                                click.echo(f"    - {service_id}")
+                        else:
+                            for service_id in services[:3]:
+                                click.echo(f"    - {service_id}")
+                            click.echo(f"    - ... 和另外 {len(services)-3} 个实例")
+                else:
+                    click.echo("\n服务来源: 未知 (无地址信息)")
+                
+                # 添加超时配置信息
+                click.echo("\n超时配置:")
+                click.echo(f"  空闲服务超时: {info.get('idle_heartbeat_timeout', info.get('heartbeat_timeout', '未知'))}秒")
+                click.echo(f"  忙碌服务超时: {info.get('busy_heartbeat_timeout', '未知')}秒")
             
             if queue_status:
                 # 获取队列状态
@@ -213,10 +281,10 @@ def client(host, port, list, router_info, queue_status, call, args, timeout, api
 @click.option('--host', '-h', default='127.0.0.1', help='Router地址')
 @click.option('--port', '-p', default=5555, help='Router端口')
 @click.option('--module', '-m', required=True, help='包含ServiceDealer类的Python模块路径')
-@click.option('--class', 'class_names', required=True, multiple=True, help='ServiceDealer类名(可多次指定)')
+@click.option('--class', 'class_names', multiple=True, help='ServiceDealer类名(可多次指定，不指定则自动推断)')
 @click.option('--instances', '-n', default=1, help='每个类启动的实例数量')
 @click.option('--max-concurrent', default=100, help='最大并发请求数')
-@click.option('--heartbeat', default=0.5, help='心跳间隔（秒）')
+@click.option('--heartbeat', default=30, help='心跳间隔（秒）')
 @click.option('--api-key', help='API认证密钥')
 @click.option('--logger-level', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']), default='INFO', help='日志级别')
 def dealer(host, port, module, class_names, instances, max_concurrent, heartbeat, api_key, logger_level):
@@ -241,21 +309,36 @@ def dealer(host, port, module, class_names, instances, max_concurrent, heartbeat
             if isinstance(attr, type) and issubclass(attr, ServiceDealer) and attr != ServiceDealer:
                 available_classes[name] = attr
         
-        # 验证指定的类是否存在
-        dealer_classes = {}
-        for class_name in class_names:
-            if class_name not in available_classes:
-                click.echo(f"错误: 模块 {module} 中未找到类 {class_name}", err=True)
-                if available_classes:
-                    click.echo(f"可用的ServiceDealer类: {', '.join(available_classes.keys())}")
-                return
-            
-            dealer_classes[class_name] = available_classes[class_name]
-        
-        # 检查是否至少有一个类
-        if not dealer_classes:
-            click.echo("错误: 未指定任何可用的ServiceDealer类", err=True)
+        # 如果没有找到任何ServiceDealer子类
+        if not available_classes:
+            click.echo(f"错误: 模块 {module} 中未找到任何ServiceDealer子类", err=True)
             return
+        
+        # 验证/推断要使用的类
+        dealer_classes = {}
+        
+        # 如果没有指定类名，自动推断
+        if not class_names:
+            if len(available_classes) == 1:
+                # 只有一个ServiceDealer子类，直接使用
+                auto_class_name = next(iter(available_classes.keys()))
+                dealer_classes[auto_class_name] = available_classes[auto_class_name]
+                click.echo(f"自动选择唯一的ServiceDealer子类: {auto_class_name}")
+            else:
+                # 有多个ServiceDealer子类，提示用户指定
+                click.echo(f"模块 {module} 中有多个ServiceDealer子类，请使用--class参数指定要使用的类", err=True)
+                click.echo(f"可用的ServiceDealer类: {', '.join(available_classes.keys())}")
+                return
+        else:
+            # 验证指定的类是否存在
+            for class_name in class_names:
+                if class_name not in available_classes:
+                    click.echo(f"错误: 模块 {module} 中未找到类 {class_name}", err=True)
+                    if available_classes:
+                        click.echo(f"可用的ServiceDealer类: {', '.join(available_classes.keys())}")
+                    return
+                
+                dealer_classes[class_name] = available_classes[class_name]
         
         # 为每个类的每个实例创建进程
         processes = []
@@ -304,14 +387,33 @@ def dealer(host, port, module, class_names, instances, max_concurrent, heartbeat
             while any(p.is_alive() for p in processes):
                 time.sleep(0.5)
         except KeyboardInterrupt:
-            click.echo("正在终止所有Dealer服务进程...")
-            # 终止所有子进程
+            click.echo("正在优雅终止所有Dealer服务进程...")
+            
+            # 向所有子进程发送SIGINT，让它们有机会执行stop方法
             for p in processes:
                 if p.is_alive():
-                    click.echo(f"终止进程: {p.name} (PID: {p.pid})")
+                    click.echo(f"请求进程停止: {p.name} (PID: {p.pid})")
+                    os.kill(p.pid, signal.SIGINT)
+            
+            # 等待子进程优雅退出的时间
+            graceful_timeout = 5.0  # 给5秒钟时间优雅退出
+            wait_start = time.time()
+            remaining_processes = list(processes)
+            
+            while remaining_processes and time.time() - wait_start < graceful_timeout:
+                # 更新仍存活的进程列表
+                remaining_processes = [p for p in remaining_processes if p.is_alive()]
+                if remaining_processes:
+                    click.echo(f"等待 {len(remaining_processes)} 个进程完成退出... ({int(graceful_timeout - (time.time() - wait_start))}秒)")
+                    time.sleep(0.5)
+            
+            # 强制终止仍然存活的进程
+            for p in remaining_processes:
+                if p.is_alive():
+                    click.echo(f"强制终止进程: {p.name} (PID: {p.pid})")
                     p.terminate()
             
-            # 等待所有进程结束
+            # 最后等待确保所有进程结束
             for p in processes:
                 p.join(timeout=1.0)
             
@@ -373,12 +475,32 @@ async def start_dealer_service(dealer_class, class_name, address, max_concurrent
     logger.info(f"服务ID: {service._service_id}")
     logger.info(f"最大并发数: {max_concurrent}")
     
-    # 设置信号处理
+    # 设置信号处理 - 添加超时保护
     stop_event = asyncio.Event()
+    shutdown_complete = asyncio.Event()
+    
+    async def shutdown_with_timeout():
+        """带超时保护的安全关闭过程"""
+        logger.info(f"正在停止服务 {class_name} (实例 {instance_id})")
+        try:
+            # 尝试优雅关闭，最多等待3秒
+            shutdown_task = asyncio.create_task(service.stop())
+            try:
+                await asyncio.wait_for(shutdown_task, timeout=3.0)
+                logger.info(f"服务 {class_name} (实例 {instance_id}) 已正常停止")
+            except asyncio.TimeoutError:
+                logger.warning(f"服务 {class_name} (实例 {instance_id}) 停止超时，部分任务可能未完成")
+        except Exception as e:
+            logger.error(f"服务 {class_name} (实例 {instance_id}) 停止时出错: {e}")
+        finally:
+            shutdown_complete.set()
     
     def signal_handler():
         logger.info(f"收到终止信号，准备停止服务 {class_name} (实例 {instance_id})")
-        stop_event.set()
+        if not stop_event.is_set():  # 避免重复触发
+            stop_event.set()
+            # 创建关闭任务
+            asyncio.create_task(shutdown_with_timeout())
     
     # 注册SIGINT和SIGTERM处理
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -389,11 +511,35 @@ async def start_dealer_service(dealer_class, class_name, address, max_concurrent
     try:
         # 等待终止信号
         await stop_event.wait()
-    finally:
-        # 停止服务
-        logger.info(f"正在停止服务 {class_name} (实例 {instance_id})")
-        await service.stop()
-        logger.info(f"服务 {class_name} (实例 {instance_id}) 已停止")
+        # 然后等待关闭完成，最多再等5秒
+        try:
+            await asyncio.wait_for(shutdown_complete.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.critical(f"服务 {class_name} (实例 {instance_id}) 强制终止")
+            
+    except Exception as e:
+        logger.error(f"服务处理异常: {e}")
+        # 确保服务停止
+        if not shutdown_complete.is_set():
+            await service.stop()
+
+# 格式化运行时间的辅助函数
+def format_uptime(seconds):
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    parts = []
+    if days > 0:
+        parts.append(f"{days}天")
+    if hours > 0:
+        parts.append(f"{hours}小时")
+    if minutes > 0:
+        parts.append(f"{minutes}分")
+    if seconds > 0 or not parts:
+        parts.append(f"{seconds}秒")
+    
+    return " ".join(parts)
 
 if __name__ == "__main__":
     cli() 

@@ -9,6 +9,7 @@ import uuid
 import time
 import os
 from enum import Enum
+import socket
 
 from functools import wraps
 from pydantic import BaseModel
@@ -133,6 +134,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         heartbeat_timeout: float = 5.0,
         service_id: str = None,
         api_key: str = None,     # 新增: API密钥
+        port: int = None,        # 新增: 服务端口
         logger_level: int = logging.INFO,
     ):
         self._router_address = router_address
@@ -183,6 +185,9 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         self._api_key = api_key or os.environ.get("VOIDRAIL_API_KEY")
         if not self._api_key:
             self._logger.warning(f"<{self._service_id}> 未设置API密钥，可能无法连接到开启了验证的Router")
+
+        # 保存端口信息（如果提供）
+        self._port = port
 
     async def _force_reconnect(self):
         """强制完全重置连接"""
@@ -330,38 +335,64 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
     async def _register_to_router(self):
         """向Router注册服务信息"""
         try:
-            if not self._socket:
-                return
+            # 获取本机网络信息
+            hostname = socket.gethostname()
+            try:
+                # 尝试获取外部可访问的IP地址
+                ip_address = socket.gethostbyname(hostname)
+            except:
+                # 如果无法获取，使用本地回环地址
+                ip_address = "127.0.0.1"
             
-            self._service_registered = True
-            # 创建一个可序列化的方法信息副本，移除方法对象
-            methods = {}
-            for method_name, method_info in self._handlers.items():
-                reg_info = self._registry[method_name]
-                methods[method_name] = {
-                    'description': reg_info.get('description'),
-                    'params': reg_info.get('params'),
-                    'metadata': method_info['metadata']
+            # 获取进程ID作为标识
+            process_id = os.getpid()
+            
+            # 构建地址信息 - 使用更有意义的格式
+            if hasattr(self, '_port') and self._port:
+                # 如果有明确指定的端口，使用它
+                remote_addr = f"{ip_address}:{self._port}"
+            else:
+                # 否则使用进程ID和服务ID的组合
+                service_uuid = self._service_id.split('-')[-1] if '-' in self._service_id else self._service_id[-8:]
+                remote_addr = f"{ip_address} [PID:{process_id}, ID:{service_uuid}]"
+            
+            # 创建可序列化的方法信息字典
+            serializable_methods = {}
+            for name, info in self._registry.items():
+                # 只收集元数据，不包含实际方法对象
+                serializable_methods[name] = {
+                    'description': info.get('description', ''),
+                    'params': info.get('params', {}),
+                    'stream': info.get('stream', False),
+                    'metadata': info.get('metadata', {})
                 }
             
             # 构建服务信息
             service_info = {
                 "group": self._group or self._service_name,
-                "methods": methods,  # 使用可序列化的版本
+                "methods": serializable_methods,  # 使用可序列化的方法信息
                 "max_concurrent": self._max_concurrent,
                 "current_load": self._current_load,
                 "request_count": 0,
                 "reply_count": 0,
-                "api_key": self._api_key  # 添加API密钥
+                "api_key": self._api_key,
+                "remote_addr": remote_addr,
+                "host_info": {
+                    "hostname": hostname,
+                    "ip": ip_address,
+                    "pid": process_id
+                }
             }
             
-            self._logger.info(f"<{self._service_id}> Registering service with info: {service_info}")
+            self._logger.info(f"<{self._service_id}> Registering service with info: {{methods: {list(serializable_methods.keys())}, group: {self._group}, addr: {remote_addr}}}")
             
             # 发送注册请求
             await self._socket.send_multipart([
                 b"register",
                 json.dumps(service_info).encode()
             ])
+            
+            self._service_registered = True
         
         except asyncio.CancelledError:
             return
@@ -570,37 +601,31 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             try:
                 # 发送心跳
                 if self._socket and self._state == DealerState.RUNNING:
-                    # 在心跳中包含API密钥
-                    heartbeat_data = {}
-                    if self._api_key:
-                        heartbeat_data["api_key"] = self._api_key
-                        
-                    if heartbeat_data:
-                        await self._socket.send_multipart([
-                            b"heartbeat", 
-                            json.dumps(heartbeat_data).encode()
-                        ])
-                    else:
-                        await self._socket.send_multipart([b"heartbeat", b""])
+                    # 在心跳中包含API密钥和当前处理负载
+                    heartbeat_data = {
+                        "api_key": self._api_key,
+                        "processing_requests": self._current_load,
+                        "dealer_info": {
+                            "service_name": self._service_name,
+                            "group": self._group,
+                            "pid": os.getpid()
+                        }
+                    }
+                    
+                    await self._socket.send_multipart([
+                        b"heartbeat", 
+                        json.dumps(heartbeat_data).encode()
+                    ])
                 
                 if not self._service_registered:
                     await self._register_to_router()
-
-                # if counter % 100 == 19:
-                #     self._socket.close()
-                #     self._logger.info(f"<{self._service_id}> MOCK ERROR")                
+                
             except asyncio.CancelledError:
                 break
-            except zmq.ZMQError as e:
-                self._logger.error(f"<{self._service_id}> ZMQError in heartbeat loop: {e}")
-                await self.request_reconnect()
-                await asyncio.sleep(2)
             except Exception as e:
                 self._logger.error(f"<{self._service_id}> Error in heartbeat loop: {e}")
-                await self.request_reconnect()
                 await asyncio.sleep(2)
             finally:
-                counter = counter if counter < 100 else 0
                 await asyncio.sleep(self._heartbeat_interval)
 
     async def request_reconnect(self):
