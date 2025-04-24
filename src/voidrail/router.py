@@ -12,11 +12,6 @@ import logging
 import json
 import uuid
 
-class RouterMode(str, Enum):
-    """路由器模式枚举"""
-    LOAD_BALANCE = "load_balance"  # 默认负载均衡模式
-    FIFO = "fifo"                  # 先进先出模式
-
 class ServiceState(str, Enum):
     """服务状态枚举"""
     ACTIVE = "active"       # 正常运行
@@ -68,18 +63,22 @@ class ServiceInfo(BaseModel):
         return data
 
 class ServiceRouter:
-    """ZMQ ROUTER 实现，负责消息路由和服务发现"""
+    """ZMQ ROUTER 实现，负责消息路由和服务发现
+    仅使用FIFO模式，移除负载均衡模式"""
     def __init__(
         self, 
         address: str, 
         context: Optional[zmq.asyncio.Context] = None,
-        heartbeat_timeout: float = 30.0, # 空闲状态超时时间（秒）
-        router_mode: RouterMode = RouterMode.FIFO,  # 默认为FIFO模式
+        heartbeat_timeout: float = 30.0,       # 空闲状态超时时间（秒）
+        idle_heartbeat_check: float = 10.0,    # 空闲状态心跳检查间隔（秒）
         hwm: int = 1000,
-        require_auth: bool = None,           # 是否要求认证
-        dealer_api_keys: List[str] = None,   # DEALER 端 API 密钥列表
-        client_api_keys: List[str] = None,   # CLIENT 端 API 密钥列表
+        require_auth: bool = None,             # 是否要求认证
+        dealer_api_keys: List[str] = None,     # DEALER 端 API 密钥列表
+        client_api_keys: List[str] = None,     # CLIENT 端 API 密钥列表
         logger_level: int = logging.INFO,
+        use_curve: bool = False,                # 是否启用CURVE加密
+        curve_server_key_file: str = None,      # 服务器密钥文件路径
+        curve_client_directory: str = None,     # 客户端公钥目录
     ):
         self._context = context or zmq.asyncio.Context()
         self._address = address
@@ -91,10 +90,11 @@ class ServiceRouter:
         self._logger = logging.getLogger(__name__)
         self._logger.setLevel(logger_level)
         
-        # 添加不同状态的超时配置
-        self._IDLE_HEARTBEAT_TIMEOUT = heartbeat_timeout  # 默认超时(通常30秒)
-        self._BUSY_HEARTBEAT_TIMEOUT = self._IDLE_HEARTBEAT_TIMEOUT * 60  # 忙碌状态超时(60倍空闲超时)
-        self._MAX_BUSY_WITHOUT_HEARTBEAT = self._BUSY_HEARTBEAT_TIMEOUT * 2  # 忙碌状态超时(2倍空闲超时)
+        # 差异化超时配置
+        self._IDLE_HEARTBEAT_TIMEOUT = 5.0         # 空闲状态超时缩短到5秒
+        self._IDLE_HEARTBEAT_CHECK = 1.5           # 检查间隔调整为1.5秒，更快检测故障
+        self._BUSY_HEARTBEAT_TIMEOUT = heartbeat_timeout * 60   # 忙碌状态超时(60倍空闲超时)
+        self._MAX_BUSY_WITHOUT_HEARTBEAT = self._BUSY_HEARTBEAT_TIMEOUT * 2  # 忙碌最大无心跳时间
         
         # 状态管理
         self._state = RouterState.INIT
@@ -112,15 +112,11 @@ class ServiceRouter:
         # 服务健康检查任务
         self._service_health_check_task = None
         
-        # 路由模式
-        self._router_mode = router_mode
-        
         # FIFO模式相关
-        self._method_queues = defaultdict(deque)  # 为每个方法创建请求队列
+        self._method_queues = defaultdict(deque)    # 为每个方法创建请求队列
         self._dealer_processing = defaultdict(int)  # 记录每个DEALER端当前处理的请求数
 
         # API密钥认证配置
-        # 首先检查环境变量中是否要求认证
         env_require_auth = os.environ.get("VOIDRAIL_REQUIRE_AUTH", "").lower()
         self._require_auth = require_auth if require_auth is not None else (env_require_auth in ('1', 'true', 'yes'))
         
@@ -144,7 +140,7 @@ class ServiceRouter:
         else:
             self._logger.info("API密钥认证未启用")
 
-        # 添加以下全局统计信息
+        # 统计信息
         self._total_request_count = 0
         self._total_response_count = 0
         self._start_time = time()
@@ -157,6 +153,39 @@ class ServiceRouter:
 
         # 记录DEALER最后一次报告忙碌的时间
         self._service_busy_since = {}  # service_id -> timestamp
+        
+        # 服务重连监控
+        self._dealer_reconnect_attempts = {}  # 记录服务重连尝试次数
+
+        # 新增：连续失败计数阈值
+        self._CONSECUTIVE_FAILURES_THRESHOLD = 2
+
+        # CURVE加密设置
+        self._use_curve = use_curve
+        self._auth = None
+        
+        if self._use_curve:
+            # 初始化认证器
+            self._auth = zmq.auth.ThreadAuthenticator(self._context)
+            self._auth.start()
+            
+            # 加载服务器密钥
+            server_public, server_secret = zmq.auth.load_certificate(curve_server_key_file)
+            
+            # 设置CURVE认证 - 指定客户端公钥目录
+            if curve_client_directory:
+                # 严格模式 - 只允许已授权的客户端
+                self._auth.configure_curve(domain='*', location=curve_client_directory)
+            else:
+                # 开发模式 - 允许任何CURVE客户端
+                self._auth.configure_curve(domain='*', location=zmq.auth.CURVE_ALLOW_ANY)
+            
+            # 设置socket
+            self._socket.curve_secretkey = server_secret
+            self._socket.curve_publickey = server_public
+            self._socket.curve_server = True
+            
+            self._logger.info(f"CURVE加密已启用，服务器公钥: {server_public.hex()[:8]}...")
 
     async def _force_reconnect(self):
         """强制完全重置连接"""
@@ -336,20 +365,13 @@ class ServiceRouter:
         self._logger.error(f"Error sending to {from_id}: {error}")
 
     async def _route_messages(self):
-        """消息路由主循环
-        通信协议要求：
-        1. identiy_id 必须为 UTF-8 编码的字符串
-        2. 统一使用 multipart 格式
-            - multipart[0] 为 identiy_id
-            - multipart[1] 为消息类型
-            - multipart[2:] 根据消息类型各自约定
-        """
-        self._logger.info(f"Routing messages handler started on {self._address}, {self._socket}")
+        """消息路由主循环 - 修改为仅支持FIFO模式"""
+        self._logger.info(f"路由消息处理器启动于 {self._address}")
         while self._state == RouterState.RUNNING:
             try:
                 multipart = await self._socket.recv_multipart()
                 if len(multipart) < 2:
-                    self._logger.warning(f"Received invalid message format: {multipart}")
+                    self._logger.warning(f"收到无效消息格式: {multipart}")
                     continue
                 
                 from_id_bytes = multipart[0]  # 消息来源ID (bytes)
@@ -359,6 +381,7 @@ class ServiceRouter:
                 
                 # 处理客户端认证请求
                 if message_type == "auth":
+                    # API_KEY认证请求数据内容已通过CURVE加密
                     if len(multipart) < 3:
                         await self._send_error(from_id_bytes, "Invalid auth format")
                         continue
@@ -366,6 +389,7 @@ class ServiceRouter:
                     auth_data = json.loads(multipart[2].decode())
                     api_key = auth_data.get("api_key", "")
                     
+                    # API_KEY验证，作为应用层认证
                     if self._verify_client_api_key(api_key):
                         self._authenticated_clients.add(from_id)
                         response = {
@@ -391,10 +415,14 @@ class ServiceRouter:
                         service = self._services[from_id]
                         if service.state == ServiceState.INACTIVE:
                             service.state = ServiceState.ACTIVE
-                            self._logger.info(f"Service {from_id} reactivated after receiving message of type {message_type}")
+                            self._logger.info(f"服务 {from_id} 在收到 {message_type} 类型消息后重新激活")
                         service.last_heartbeat = time()
+                        
+                        # 重置重连计数
+                        if from_id in self._dealer_reconnect_attempts:
+                            del self._dealer_reconnect_attempts[from_id]
 
-                # 然后再处理特定消息类型
+                # 处理特定消息类型
                 if message_type == "router_monitor":
                     await self._socket.send_multipart([
                         from_id_bytes,
@@ -519,11 +547,11 @@ class ServiceRouter:
                 elif message_type == "call_from_client":
                     # 客户端认证检查
                     if self._require_auth and not self._check_client_auth(from_id):
-                        await self._send_error(from_id_bytes, "Not authenticated")
+                        await self._send_error(from_id_bytes, "未认证")
                         continue
                         
                     if len(multipart) < 3:
-                        self._logger.error(f"Invalid call message format")
+                        self._logger.error(f"无效的调用消息格式")
                         continue
                         
                     service_name = multipart[2].decode()
@@ -531,44 +559,16 @@ class ServiceRouter:
                     # 更新全局请求计数
                     self._total_request_count += 1
                     
-                    # FIFO模式: 将请求加入队列并尝试处理
-                    if self._router_mode == RouterMode.FIFO:
-                        # 将请求加入队列
-                        queue_item = {
-                            'from_id_bytes': from_id_bytes,
-                            'multipart': multipart[2:],
-                        }
-                        self._method_queues[service_name].append(queue_item)
-                        self._logger.info(f"FIFO: 已将请求加入 {service_name} 队列，当前长度: {len(self._method_queues[service_name])}")
-                        
-                        # 尝试处理队列中的请求
-                        await self._process_fifo_queue(service_name)
-                    else:
-                        # 原有负载均衡模式
-                        target_service = self._select_best_service(service_name)
-                        if target_service and target_service.state == ServiceState.ACTIVE:
-                            target_service.accept_request()
-                            self._services[target_service.service_id].accept_request()
-                            service_dealer_id = target_service.service_id.encode()
-                            await self._socket.send_multipart([
-                                service_dealer_id,
-                                b"call_from_router",
-                                from_id_bytes,
-                                *multipart[2:]
-                            ])
-                        else:
-                            error_msg = f"No available service for method {service_name}"
-                            self._logger.error(f"{error_msg}")
-                            error = {
-                                "type": "error",
-                                "request_id": str(uuid.uuid4()),
-                                "error": error_msg
-                            }
-                            await self._socket.send_multipart([
-                                from_id_bytes,
-                                b"reply_from_router",
-                                json.dumps(error).encode()
-                            ])
+                    # 将请求加入队列
+                    queue_item = {
+                        'from_id_bytes': from_id_bytes,
+                        'multipart': multipart[2:],
+                    }
+                    self._method_queues[service_name].append(queue_item)
+                    self._logger.info(f"FIFO: 已将请求加入 {service_name} 队列，当前长度: {len(self._method_queues[service_name])}")
+                    
+                    # 尝试处理队列中的请求
+                    await self._process_fifo_queue(service_name)
 
                 elif message_type in ["overload", "resume", "shutdown"]:
                     # 处理服务状态变更消息
@@ -589,7 +589,7 @@ class ServiceRouter:
                 # 如果是已注册服务的回复消息，直接转发给客户端
                 elif from_id in self._services and message_type == "reply_from_dealer":
                     if len(multipart) < 3:
-                        await self._send_error(from_id_bytes, "Invalid reply format")
+                        await self._send_error(from_id_bytes, "无效的回复格式")
                         continue
                         
                     target_client_id = multipart[2]  # 目标客户端ID
@@ -608,17 +608,16 @@ class ServiceRouter:
                     # 更新服务状态
                     self._services[from_id].complete_request()
                     
-                    # FIFO模式: 处理完成后更新状态并尝试处理下一个请求
-                    if self._router_mode == RouterMode.FIFO:
-                        # 减少处理计数
-                        self._dealer_processing[from_id] -= 1
-                        if self._dealer_processing[from_id] < 0:
-                            self._dealer_processing[from_id] = 0
-                            
-                        # 处理所有队列中的请求
-                        for method_name in self._method_queues.keys():
-                            if method_name in self._services[from_id].methods and len(self._method_queues[method_name]) > 0:
-                                await self._process_fifo_queue(method_name)
+                    # 减少处理计数
+                    self._dealer_processing[from_id] -= 1
+                    if self._dealer_processing[from_id] < 0:
+                        self._dealer_processing[from_id] = 0
+                        
+                    # 处理所有队列中的请求
+                    for method_name in list(self._method_queues.keys()):
+                        if len(self._method_queues[method_name]) > 0 and \
+                           method_name in self._services[from_id].methods:
+                            await self._process_fifo_queue(method_name)
 
                 elif message_type == "queue_status":
                     # 客户端认证检查
@@ -696,7 +695,7 @@ class ServiceRouter:
                     
                     # 改进的信息响应
                     router_info = {
-                        "mode": self._router_mode.value,
+                        "mode": "fifo",
                         "address": self._address,
                         "idle_heartbeat_timeout": self._IDLE_HEARTBEAT_TIMEOUT,
                         "busy_heartbeat_timeout": self._BUSY_HEARTBEAT_TIMEOUT,
@@ -732,7 +731,7 @@ class ServiceRouter:
                     await self._send_error(from_id_bytes, f"Unknown message type: {message_type}")
 
             except Exception as e:
-                self._logger.error(f"Router error: {e}", exc_info=True)
+                self._logger.error(f"Router错误: {e}", exc_info=True)
                 try:
                     await self._send_error(from_id_bytes, f"Service Router Error")
                 except:
@@ -747,7 +746,7 @@ class ServiceRouter:
         # 尝试处理队列中的所有请求，直到没有可用的服务或队列为空
         while self._method_queues[method_name]:
             # 获取一个空闲的服务
-            target_service = self._select_best_service_fifo(method_name)
+            target_service = self._select_best_service(method_name)
             if not target_service:
                 # 没有可用服务，等待下次有服务完成任务后再处理
                 self._logger.info(f"FIFO: 没有空闲的DEALER处理 {method_name} 队列中的请求，队列长度: {len(self._method_queues[method_name])}")
@@ -777,106 +776,80 @@ class ServiceRouter:
                             f"队列剩余: {len(self._method_queues[method_name])}，"
                             f"DEALER当前处理数: {self._dealer_processing[target_service.service_id]}")
 
-    def _select_best_service_fifo(self, method_name: str) -> Optional[ServiceInfo]:
-        """FIFO模式下选择最佳服务实例 - 优先选择空闲的服务"""
+    def _select_best_service(self, method_name: str) -> Optional[ServiceInfo]:
+        """选择最佳服务实例 - 只保留FIFO策略"""
+        # 找出可用于处理该方法的空闲服务
         available_services = [
             service for service in self._services.values()
             if (method_name in service.methods and 
                 service.state == ServiceState.ACTIVE and
-                # 在FIFO模式下，只有当前没有处理任务的服务才能被选中
+                # 只有当前没有处理任务的服务才能被选中
                 self._dealer_processing.get(service.service_id, 0) == 0)
         ]
         
         if not available_services:
             return None
             
-        # 随机选择一个可用服务，防止总是选同一个
-        return available_services[0]
-
-    def _select_best_service(self, method_name: str) -> Optional[ServiceInfo]:
-        """选择最佳服务实例"""
-        # 根据路由模式选择不同的策略
-        if self._router_mode == RouterMode.FIFO:
-            return self._select_best_service_fifo(method_name)
-        
-        # 原有负载均衡模式
-        available_services = [
-            service for service in self._services.values()
-            if (method_name in service.methods and 
-                service.state == ServiceState.ACTIVE and
-                service.current_load < service.max_concurrent)
-        ]
-        for service in available_services:
-            s = self._services[service.service_id]
-            self._logger.info(f"Available service for [{method_name}]: {s.service_id} current_load: {s.current_load} / max_concurrent: {s.max_concurrent}")
-        
-        if not available_services:
-            return None
-            
-        # 选择负载最小的服务
-        return min(available_services, key=lambda s: s.current_load)
+        # 优先选择长时间空闲的服务
+        return min(available_services, 
+                  key=lambda s: self._dealer_processing.get(s.service_id, 0))
 
     async def _check_service_health(self):
-        """检查服务健康状态 - 支持差异化超时"""
-        self._logger.info(f"Dealer service health check handler started")
+        """检查服务健康状态 - 加入连续失败计数"""
+        self._logger.info(f"服务健康检查处理器启动")
+        self._service_heartbeat_failures = defaultdict(int)  # 记录连续心跳失败次数
+        
         while self._state == RouterState.RUNNING:
             current_time = time()
             
             # 检查服务心跳
             for service_id, service in list(self._services.items()):
-                if service.state != ServiceState.SHUTDOWN:
-                    heartbeat_age = current_time - service.last_heartbeat
+                if service.state == ServiceState.SHUTDOWN:
+                    continue  # 跳过已主动下线的服务
                     
-                    # 根据服务状态确定超时时间
-                    if service.current_load > 0:
-                        # 忙碌服务使用宽松的超时时间
-                        timeout = self._BUSY_HEARTBEAT_TIMEOUT
-                        
-                        # 检查是否超过最大忙碌无心跳时间
-                        busy_time = current_time - self._service_busy_since.get(service_id, current_time)
-                        if busy_time > self._MAX_BUSY_WITHOUT_HEARTBEAT:
-                            self._logger.warning(
-                                f"Service {service_id} has been busy without fresh heartbeat for "
-                                f"{busy_time:.1f}s, forcing inactive state"
-                            )
-                            service.state = ServiceState.INACTIVE
-                            service.current_load = 0
-                            if service_id in self._service_busy_since:
-                                del self._service_busy_since[service_id]
-                    else:
-                        # 空闲服务使用严格的超时时间
-                        timeout = self._IDLE_HEARTBEAT_TIMEOUT
+                heartbeat_age = current_time - service.last_heartbeat
+                
+                # 根据服务状态确定超时时间
+                if service.current_load > 0:
+                    # 忙碌服务使用宽松的超时时间
+                    timeout = self._BUSY_HEARTBEAT_TIMEOUT
+                    # 重置空闲状态下的连续失败计数
+                    self._service_heartbeat_failures[service_id] = 0
+                else:
+                    # 空闲服务使用严格的超时时间(5秒)
+                    timeout = self._IDLE_HEARTBEAT_TIMEOUT
+                
+                # 检查心跳是否超时
+                if heartbeat_age > timeout:
+                    # 增加连续失败计数
+                    self._service_heartbeat_failures[service_id] += 1
+                    consecutive_failures = self._service_heartbeat_failures[service_id]
                     
-                    # 检查心跳是否超时
-                    if heartbeat_age > timeout:
+                    # 连续失败次数超过阈值才标记为不活跃
+                    if consecutive_failures >= self._CONSECUTIVE_FAILURES_THRESHOLD:
                         if service.state != ServiceState.INACTIVE:
                             service.state = ServiceState.INACTIVE
                             self._logger.warning(
-                                f"Service {service_id} marked as inactive: "
-                                f"last heartbeat was {heartbeat_age:.1f}s ago "
-                                f"(timeout: {timeout:.1f}s, busy: {service.current_load > 0})"
+                                f"服务 {service_id} 标记为不活跃: "
+                                f"连续 {consecutive_failures} 次心跳超时 "
+                                f"(上次心跳: {heartbeat_age:.1f}秒前, 超时阈值: {timeout:.1f}秒)"
                             )
                             service.current_load = 0
                             
-                        # 如果是空闲服务且超时时间过长，直接删除
-                        if service.current_load == 0 and heartbeat_age > self._IDLE_HEARTBEAT_TIMEOUT * 3:
-                            self._logger.warning(f"Removing inactive service: {service_id}")
-                            self.unregister_service(service_id)
+                            # 记录重连尝试
+                            self._dealer_reconnect_attempts[service_id] = \
+                                self._dealer_reconnect_attempts.get(service_id, 0) + 1
+                    else:
+                        # 未达到连续失败阈值，记录警告但不改变状态
+                        self._logger.info(
+                            f"服务 {service_id} 心跳延迟 ({heartbeat_age:.1f}秒), "
+                            f"连续失败次数: {consecutive_failures}/{self._CONSECUTIVE_FAILURES_THRESHOLD}"
+                        )
+                else:
+                    # 心跳正常，重置失败计数
+                    self._service_heartbeat_failures[service_id] = 0
             
-            # 周期性清理无效服务和状态信息
-            if current_time - self._last_service_cleanup > 300:  # 每5分钟
-                self._last_service_cleanup = current_time
-                
-                # 清理服务源记录
-                invalid_sources = set(self._service_sources.keys()) - set(self._services.keys())
-                for invalid_id in invalid_sources:
-                    if invalid_id in self._service_sources:
-                        self._logger.warning(f"移除无效的服务源记录: {invalid_id}")
-                        del self._service_sources[invalid_id]
-                
-                # 清理忙碌时间记录
-                invalid_busy = set(self._service_busy_since.keys()) - set(self._services.keys())
-                for invalid_id in invalid_busy:
-                    del self._service_busy_since[invalid_id]
+            # 其他检查代码...
             
-            await asyncio.sleep(self._IDLE_HEARTBEAT_TIMEOUT / 2)  # 检查间隔为标准超时的一半
+            # 使用更短的检查间隔
+            await asyncio.sleep(self._IDLE_HEARTBEAT_CHECK)
