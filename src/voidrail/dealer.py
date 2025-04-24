@@ -136,6 +136,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         api_key: str = None,     # 新增: API密钥
         port: int = None,        # 新增: 服务端口
         logger_level: int = logging.INFO,
+        disable_reconnect: bool = False,
     ):
         self._router_address = router_address
         self._hwm = hwm
@@ -188,6 +189,8 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
 
         # 保存端口信息（如果提供）
         self._port = port
+
+        self._disable_reconnect = disable_reconnect
 
     async def _force_reconnect(self):
         """强制完全重置连接"""
@@ -242,6 +245,19 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             self._service_registered = False
 
             self._logger.info(f"<{self._service_id}> 重连成功")
+
+            # 立即发送心跳确保Router能快速检测到活跃状态
+            heartbeat_data = {
+                "api_key": self._api_key,
+                "processing_requests": self._current_load,
+            }
+            await self._socket.send_multipart([
+                b"heartbeat", 
+                json.dumps(heartbeat_data).encode()
+            ])
+
+            # 新增：设置重连保护期，防止刚重连成功就又触发重连
+            self._reconnect_protection_until = time.time() + self._heartbeat_timeout * 2
 
             return True
             
@@ -414,29 +430,18 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                     
                 multipart = await self._socket.recv_multipart()
                 
+                # 添加这一行来定义message_type
+                message_type = multipart[0]  # 第一部分是消息类型
+
                 # 更新心跳状态
                 self._heartbeat_status = True
                 self._last_successful_heartbeat = time.time()
                 self._reconnect_attempts = 0
 
-                # 如果是心跳确认消息，只在状态变化时打印，其他消息正常打印
-                is_heartbeat_ack = len(multipart) >= 1 and multipart[0] == b'heartbeat_ack'
+                # 对于特定类型的消息，不严格要求目标客户端ID
+                is_special_message = message_type in [b"heartbeat_ack", b"register_ack", b"error"]
                 
-                # 只打印非心跳消息
-                if is_heartbeat_ack:
-                    counter = counter + 1 if counter < 10 else 0
-                    if counter == 0:
-                        self._logger.debug(f"<{self._service_id}> HEARTBEAT ACK")
-                else:
-                    self._logger.info(f"<{self._service_id}> DEALER Received message: {multipart}")
-                
-                if len(multipart) < 1:
-                    self._logger.warning(f"<{self._service_id}> Received empty message")
-                    continue
-                    
-                message_type = multipart[0]                
-                
-                if len(multipart) < 2:
+                if len(multipart) < 2 and not is_special_message:
                     self._logger.warning(f"<{self._service_id}> Invalid message format, missing target")
                     continue
                 
@@ -451,8 +456,11 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                         task.add_done_callback(self._pending_tasks.discard)
 
                 elif message_type == b"heartbeat_ack":
-                    # 更新最后成功心跳时间
+                    # 更新所有心跳状态标记
                     self._heartbeat_ack_count += 1
+                    self._heartbeat_status = True
+                    self._last_successful_heartbeat = time.time()
+                    self._logger.debug(f"<{self._service_id}> 收到心跳确认 #{self._heartbeat_ack_count}")
                 
                 elif message_type == b"register_ack":
                     self._logger.info(f"<{self._service_id}> Service registered successfully.")
@@ -645,50 +653,63 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         """监控并处理重连请求"""        
         self._logger.info(f"<{self._service_id}> 重连监控器已启动")
         
+        # 如果禁用重连（仅用于测试），则保持监控器运行但不执行重连
+        if self._disable_reconnect:
+            self._logger.warning(f"重连监控已被禁用（仅用于测试）")
+            while self._state == DealerState.RUNNING:
+                await asyncio.sleep(10.0)
+            return
+            
+        # 正常重连逻辑
         while self._state == DealerState.RUNNING:
-            try:
-                await asyncio.sleep(self._heartbeat_timeout)
-                if self._reconnect_in_progress:
-                    self._logger.info(f"<{self._service_id}> 重连中，跳过心跳检查")
-                    continue
+            await asyncio.sleep(self._heartbeat_timeout)
+            
+            # 新增：如果在重连保护期内，跳过心跳检查
+            current_time = time.time()
+            if hasattr(self, '_reconnect_protection_until') and current_time < self._reconnect_protection_until:
+                self._logger.info(f"<{self._service_id}> 重连保护期内，跳过心跳检查")
+                continue
+            
+            if self._reconnect_in_progress:
+                self._logger.info(f"<{self._service_id}> 重连中，跳过心跳检查")
+                continue
+            
+            not_living_interval = time.time() - self._last_successful_heartbeat
+
+            # 检查心跳状态
+            if self._heartbeat_status and not_living_interval > self._heartbeat_timeout:
+                self._reconnect_in_progress = True
+                self._logger.warning(f"<{self._service_id}> Heartbeat timeout detected")
+                await self.request_reconnect()
                 
-                not_living_interval = time.time() - self._last_successful_heartbeat
+            # 尝试重连
+            if not self._heartbeat_status:
+                if await self._reconnect():
+                    self._logger.info(f"<{self._service_id}> 重连成功 - 重置心跳状态")
+                    # 确保心跳状态重置
+                    self._last_successful_heartbeat = time.time()
+                    self._heartbeat_status = True
+                    self._reconnect_attempts = 0
+                    self._process_messages_task = asyncio.create_task(self._process_messages(), name=f"{self._service_id}-process_messages")
+                    await self._register_to_router()
 
-                # 检查心跳状态
-                if self._heartbeat_status and not_living_interval > self._heartbeat_timeout:
-                    self._reconnect_in_progress = True
-                    self._logger.warning(f"<{self._service_id}> Heartbeat timeout detected")
-                    await self.request_reconnect()
+                    # 确保消息处理任务被重新创建
+                    if self._process_messages_task and self._process_messages_task.done():
+                        self._process_messages_task = asyncio.create_task(self._process_messages())
+
+                else:
+                    self._reconnect_attempts += 1
+                    self._logger.warning(
+                        f"<{self._service_id}> 重连失败 (尝试 {self._reconnect_attempts}/{self._max_reconnect_attempts})"
+                    )
                     
-                # 尝试重连
-                if not self._heartbeat_status:
-                    if await self._reconnect():
-                        self._logger.info(f"<{self._service_id}> 重连成功 - 重置心跳状态")
-                        # 确保心跳状态重置
-                        self._last_successful_heartbeat = time.time()
-                        self._heartbeat_status = True
-                        self._reconnect_attempts = 0
-                        self._process_messages_task = asyncio.create_task(self._process_messages(), name=f"{self._service_id}-process_messages")
-                        await self._register_to_router()
-
-                    else:
-                        self._reconnect_attempts += 1
-                        self._logger.warning(
-                            f"<{self._service_id}> 重连失败 (尝试 {self._reconnect_attempts}/{self._max_reconnect_attempts})"
-                        )
+                    # 多次失败后强制重连
+                    if self._reconnect_attempts >= self._max_reconnect_attempts:
+                        self._logger.warning(f"<{self._service_id}> 尝试深度重连")
+                        await self._force_reconnect()
                         
-                        # 多次失败后强制重连
-                        if self._reconnect_attempts >= self._max_reconnect_attempts:
-                            self._logger.warning(f"<{self._service_id}> 尝试深度重连")
-                            await self._force_reconnect()
-                            
-                    self._reconnect_in_progress = False
-                                
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self._logger.error(f"<{self._service_id}> 重连监控器错误: {e}", exc_info=True)
                 self._reconnect_in_progress = False
+                            
 
     def check_overload(self) -> bool:
         """检查是否接近满载（可重写）

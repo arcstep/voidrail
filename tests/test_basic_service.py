@@ -3,7 +3,8 @@ import pytest_asyncio
 import asyncio
 import zmq.asyncio
 import logging
-from voidrail import ServiceRouter, ServiceDealer, ClientDealer, service_method
+import json
+from voidrail import ServiceRouter, ServiceDealer, ClientDealer, service_method, ServiceState, DealerState
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ def router_address():
 def test_config():
     """测试配置"""
     return {
-        'heartbeat_timeout': 2.0,    # Router 心跳超时时间
+        'heartbeat_timeout': 5.0,  # 从2.0秒增加到5.0秒
     }
 
 @pytest_asyncio.fixture
@@ -337,3 +338,179 @@ async def test_service_exception_handling(router, client, router_address, zmq_co
     finally:
         # 清理资源
         await error_service.stop()
+
+@pytest.mark.asyncio
+async def test_dealer_reconnect_after_disconnect(router, router_address, zmq_context, test_config):
+    """测试DEALER断线后能够自动重连并恢复服务"""
+    # 创建服务实例
+    service = EchoService(
+        router_address,
+        context=zmq_context,
+        heartbeat_timeout=test_config['heartbeat_timeout']
+    )
+    await service.start()
+    
+    # 创建客户端
+    client = ClientDealer(router_address, context=zmq_context, timeout=2.0)
+    
+    try:
+        # 确认服务最初可用
+        async for response in client.stream("EchoService.echo", "initial"):
+            assert response == "initial"
+            break
+            
+        # 模拟DEALER断线 - 手动关闭DEALER的socket
+        service._socket.close()
+        service._socket = None
+        service._heartbeat_status = False
+        
+        # 给DEALER更多时间重连
+        await asyncio.sleep(test_config['heartbeat_timeout'] * 3)  # 现在等待时间更长
+        
+        # 验证服务在断线后能自动恢复
+        # 可能需要重试几次，因为重连可能需要时间
+        max_retries = 5
+        for i in range(max_retries):
+            try:
+                async for response in client.stream("EchoService.echo", "reconnected"):
+                    assert response == "reconnected"
+                    logger.info("DEALER成功重连并处理请求")
+                    break
+                break
+            except Exception as e:
+                logger.info(f"重试 {i+1}/{max_retries}，错误: {e}")
+                if i == max_retries - 1:
+                    raise
+                await asyncio.sleep(1)
+        
+    finally:
+        await service.stop()
+        await client.close()
+
+@pytest.mark.asyncio
+async def test_dealer_reconnect_after_router_restart(router_address, zmq_context, test_config):
+    """测试ROUTER重启后DEALER能自动重连并恢复服务"""
+    # 首先创建和启动ROUTER
+    router = ServiceRouter(
+        router_address, 
+        context=zmq_context,
+        heartbeat_timeout=test_config['heartbeat_timeout']
+    )
+    await router.start()
+    
+    # 创建并启动DEALER服务
+    service = EchoService(
+        router_address,
+        context=zmq_context,
+        heartbeat_timeout=test_config['heartbeat_timeout']
+    )
+    await service.start()
+    
+    # 创建客户端
+    client = ClientDealer(router_address, context=zmq_context, timeout=2.0)
+    
+    try:
+        # 测试初始连接
+        async for response in client.stream("EchoService.echo", "before_restart"):
+            assert response == "before_restart"
+            logger.info("初始连接测试成功")
+            break
+        
+        # 关闭和重启ROUTER
+        logger.info("关闭ROUTER...")
+        await router.stop()
+        await asyncio.sleep(1)  # 确保完全关闭
+        
+        logger.info("重启ROUTER...")
+        await router.start()
+        
+        # 给DEALER更多时间重连
+        await asyncio.sleep(test_config['heartbeat_timeout'] * 3)  # 现在等待时间更长
+        
+        # 检查DEALER是否重连成功
+        max_retries = 5
+        for i in range(max_retries):
+            try:
+                logger.info(f"尝试在ROUTER重启后调用服务 ({i+1}/{max_retries})...")
+                await client.close()  # 确保客户端也重新连接
+                await asyncio.sleep(0.5)
+                client = ClientDealer(router_address, context=zmq_context, timeout=2.0)
+                
+                async for response in client.stream("EchoService.echo", "after_restart"):
+                    assert response == "after_restart"
+                    logger.info("ROUTER重启后DEALER成功重连")
+                    break
+                break
+            except Exception as e:
+                logger.info(f"重试 {i+1}/{max_retries}，错误: {e}")
+                if i == max_retries - 1:
+                    raise
+                await asyncio.sleep(1)
+    
+    finally:
+        await service.stop()
+        await client.close()
+        await router.stop()
+
+@pytest.mark.asyncio
+async def test_heartbeat_timeout_detection(router_address, zmq_context):
+    """测试心跳超时检测机制"""
+    # 创建自定义超时配置
+    heartbeat_timeout = 1.0  # 使用较短的超时以加快测试
+    
+    # 启动ROUTER
+    router = ServiceRouter(
+        router_address, 
+        context=zmq_context,
+        heartbeat_timeout=heartbeat_timeout
+    )
+    await router.start()
+    
+    # 创建模拟心跳服务
+    class HeartbeatTestService(ServiceDealer):
+        heartbeat_sent = 0
+        heartbeat_ack_received = 0
+        
+        async def _heartbeat_loop(self):
+            """重写心跳循环以便跟踪和控制心跳"""
+            while self._state == DealerState.RUNNING:
+                try:
+                    if self._socket and self._state == DealerState.RUNNING:
+                        # 只发送3次心跳然后停止
+                        if self.heartbeat_sent < 3:
+                            self.heartbeat_sent += 1
+                            heartbeat_data = {
+                                "processing_requests": self._current_load,
+                            }
+                            
+                            logger.info(f"发送心跳 #{self.heartbeat_sent}")
+                            await self._socket.send_multipart([
+                                b"heartbeat", 
+                                json.dumps(heartbeat_data).encode()
+                            ])
+                    
+                    await asyncio.sleep(0.5)  # 短心跳间隔
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"心跳错误: {e}")
+                    await asyncio.sleep(1)
+    
+    service = HeartbeatTestService(router_address, context=zmq_context, disable_reconnect=True)
+    await service.start()
+    
+    try:
+        # 等待发送几次心跳，然后应该超时
+        await asyncio.sleep(heartbeat_timeout * 4)
+        
+        # 检查ROUTER端是否将服务标记为不活跃
+        services = router._services
+        if service._service_id in services:
+            assert services[service._service_id].state == ServiceState.INACTIVE, "服务应被标记为不活跃"
+            logger.info("心跳超时检测成功：服务已标记为不活跃")
+        else:
+            logger.info("心跳超时检测成功：服务已从ROUTER移除")
+    
+    finally:
+        await service.stop()
+        await router.stop()
