@@ -569,7 +569,11 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                         await asyncio.sleep(2)
                     except Exception as e:
                         self._logger.error(f"<{self._service_id}> DEALER Handler error: {e}", exc_info=True)
-                        await asyncio.sleep(2)
+                        # 向客户端发送错误响应
+                        await self._send_error(
+                            target_client_id,
+                            f"Method execution error: {str(e)}"
+                        )
                 except Exception as e:
                     self._logger.error(f"<{self._service_id}> DEALER Request processing error: {e}", exc_info=True)
         finally:

@@ -279,3 +279,61 @@ async def test_service_failover(router, service, second_service, client):
     logger.info(f"all_clusters: {all_clusters}")
     clusters = {k: v for k, v in all_clusters.items() if v['state'] == 'active'}
     assert len(clusters.keys()) == 1, "应该只剩一个服务"
+
+@pytest.mark.asyncio
+async def test_service_exception_handling(router, client, router_address, zmq_context):
+    """测试服务端抛出异常时客户端能正确接收错误信息"""
+    
+    # 创建一个带有异常抛出方法的服务类
+    class ErrorService(ServiceDealer):
+        @service_method
+        async def throw_error(self, error_message: str = "测试异常"):
+            """故意抛出异常的方法"""
+            logger.info(f"服务端即将抛出异常: {error_message}")
+            raise ValueError(error_message)
+            
+        @service_method
+        async def conditional_error(self, should_fail: bool = False):
+            """根据条件决定是否抛出异常"""
+            if should_fail:
+                raise RuntimeError("条件触发的异常")
+            return "成功执行，无异常"
+    
+    # 创建并启动错误服务
+    error_service = ErrorService(router_address, context=zmq_context)
+    await error_service.start()
+    
+    try:
+        # 等待服务注册完成
+        await asyncio.sleep(1.0)
+        
+        # 重新获取可用方法，确保错误服务已注册到路由器
+        await client.discover_services()
+        
+        # 测试1: 截获异常并验证错误消息
+        error_message = "测试异常信息12345"
+        error_received = False
+        
+        # 当前实现下会抛出异常，所以需要捕获
+        try:
+            async for response in client.stream("ErrorService.throw_error", error_message):
+                # 如果能进入这个循环，说明服务返回了正常响应
+                pass
+        except RuntimeError as e:
+            error_received = True
+            # 验证错误信息
+            error_str = str(e)
+            logger.info(f"客户端收到异常: {type(e).__name__}: {error_str}")
+            assert "Method execution error" in error_str
+            assert error_message in error_str
+        
+        assert error_received, "应该收到错误响应"
+        
+        # 测试2: 条件性异常 - 成功路径
+        async for response in client.stream("ErrorService.conditional_error", False):
+            assert response == "成功执行，无异常"
+            break
+            
+    finally:
+        # 清理资源
+        await error_service.stop()
