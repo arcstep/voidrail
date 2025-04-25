@@ -91,8 +91,8 @@ class ServiceRouter:
         self._logger.setLevel(logger_level)
         
         # 差异化超时配置
-        self._IDLE_HEARTBEAT_TIMEOUT = 5.0         # 空闲状态超时缩短到5秒
-        self._IDLE_HEARTBEAT_CHECK = 1.5           # 检查间隔调整为1.5秒，更快检测故障
+        self._IDLE_HEARTBEAT_TIMEOUT = heartbeat_timeout         # 空闲状态超时认定时间
+        self._IDLE_HEARTBEAT_CHECK = idle_heartbeat_check           # 检查间隔
         self._BUSY_HEARTBEAT_TIMEOUT = heartbeat_timeout * 60   # 忙碌状态超时(60倍空闲超时)
         self._MAX_BUSY_WITHOUT_HEARTBEAT = self._BUSY_HEARTBEAT_TIMEOUT * 2  # 忙碌最大无心跳时间
         
@@ -590,18 +590,10 @@ class ServiceRouter:
                 elif message_type in ["overload", "resume", "shutdown"]:
                     # 处理服务状态变更消息
                     if from_id in self._services:
-                        if message_type == "shutdown":
-                            self._services[from_id].state = ServiceState.SHUTDOWN
-                            await self._socket.send_multipart([
-                                from_id_bytes,
-                                b"shutdown_ack",
-                            ])
-                        elif message_type == "overload":
-                            # 不必回复
-                            self._services[from_id].state = ServiceState.OVERLOAD
-                        elif message_type == "resume":
-                            # 不必回复
-                            self._services[from_id].state = ServiceState.ACTIVE
+                        # 完全移除服务而不仅标记状态
+                        self.unregister_service(from_id)  
+                        await self._socket.send_multipart([from_id_bytes, b"shutdown_ack"])
+                        self._logger.info(f"Service {from_id} has been completely unregistered")
 
                 # 如果是已注册服务的回复消息，直接转发给客户端
                 elif from_id in self._services and message_type == "reply_from_dealer":
@@ -795,21 +787,21 @@ class ServiceRouter:
 
     def _select_best_service(self, method_name: str) -> Optional[ServiceInfo]:
         """选择最佳服务实例 - 只保留FIFO策略"""
-        # 找出可用于处理该方法的空闲服务
+        # 严格筛选只选择ACTIVE状态服务
         available_services = [
             service for service in self._services.values()
             if (method_name in service.methods and 
                 service.state == ServiceState.ACTIVE and
-                # 只有当前没有处理任务的服务才能被选中
                 self._dealer_processing.get(service.service_id, 0) == 0)
         ]
+        
+        # 调试日志
+        self._logger.debug(f"For method {method_name}: Found {len(available_services)} active services")
         
         if not available_services:
             return None
             
-        # 优先选择长时间空闲的服务
-        return min(available_services, 
-                  key=lambda s: self._dealer_processing.get(s.service_id, 0))
+        return min(available_services, key=lambda s: self._dealer_processing.get(s.service_id, 0))
 
     async def _check_service_health(self):
         """检查服务健康状态 - 加入连续失败计数"""

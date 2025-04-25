@@ -256,9 +256,17 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                     finally:
                         self._socket = None
                     
-                # 2. 取消消息处理任务
+                # 2. 取消消息处理任务但保留正在处理的请求
                 if self._process_messages_task and not self._process_messages_task.done():
                     self._process_messages_task.cancel()
+                    # 等待任务取消，但不要等待太长时间
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(self._process_messages_task), 
+                            timeout=0.5
+                        )
+                    except asyncio.TimeoutError:
+                        pass
                     self._process_messages_task = None
                     
                 # 3. 创建新连接
@@ -337,10 +345,12 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         """停止服务"""
         if self._state == DealerState.STOPPED:
             return
-            
+        
+        # 添加标记防止重连
+        self._disable_reconnect = True 
         self._state = DealerState.STOPPING
         
-        # 主动通知Router服务下线（添加超时保护）
+        # 主动通知Router服务下线
         try:
             if self._socket and not self._socket.closed:
                 try:
@@ -348,15 +358,16 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                         self._socket.send_multipart([b"shutdown", b""]),
                         timeout=1.0
                     )
+                    # 等待确认回复 - 不需要处理响应内容
                     try:
                         await asyncio.wait_for(self._socket.recv_multipart(), timeout=0.5)
                     except asyncio.TimeoutError:
                         pass
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._logger.warning(f"通知Router关闭失败: {e}")
         except Exception:
             pass
-            
+        
         # 取消任务
         tasks = list(self._pending_tasks)
         
@@ -452,7 +463,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             self._logger.error(f"<{self._service_id}> Registration failed: {str(e)}", exc_info=True)
 
     async def _process_messages(self):
-        """处理消息主循环 - 增强版"""
+        """处理消息主循环 - 增加超时主动触发重连"""
         last_diagnostics_time = time.time()
         error_count = 0
         
@@ -471,15 +482,20 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                 try:
                     multipart = await asyncio.wait_for(
                         self._socket.recv_multipart(),
-                        timeout=min(2.0, self._heartbeat_interval * 3)  # 缩短超时时间
+                        timeout=min(1.0, self._heartbeat_interval * 2)  # 缩短超时时间
                     )
                 except asyncio.TimeoutError:
-                    # 重要改动：超时时主动更新心跳状态为失败
+                    # 超时时更新心跳状态
                     error_count += 1
-                    if error_count >= 2:  # 连续2次超时触发心跳状态更新
-                        self._update_heartbeat_status(False, "timeout")
-                        if error_count % 5 == 0:  # 每5次超时记录一次日志
-                            self._logger.warning(f"<{self._service_id}> 接收消息连续{error_count}次超时，可能连接已断开")
+                    self._update_heartbeat_status(False, "timeout")
+                    
+                    # 核心改进：连续超时过多次，主动触发重连
+                    if error_count >= 5 and self._state == DealerState.RUNNING:
+                        self._logger.warning(f"<{self._service_id}> 接收消息连续{error_count}次超时，主动断开重连")
+                        self._state = DealerState.RECONNECTING
+                        asyncio.create_task(self._do_reconnect())
+                        break
+                    
                     continue
                 
                 # 收到消息，重置错误计数
@@ -718,29 +734,29 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             return
         
         while self._state == DealerState.RUNNING:
-            # 更短的检查间隔，提高敏感度
-            check_interval = min(0.5, self._heartbeat_interval / 2)
+            # 更积极的检查间隔
+            check_interval = min(0.2, self._heartbeat_interval / 3)
             await asyncio.sleep(check_interval)
             
-            # 跳过保护期和进行中的重连
-            if time.time() < self._reconnect_protected_until or self._state == DealerState.RECONNECTING:
-                continue
-            
-            # 简化心跳超时判断
+            # 更激进的超时判断
             not_living_interval = time.time() - self._last_successful_heartbeat
-            threshold = self._heartbeat_timeout * 0.8  # 提前触发重连
+            threshold = self._heartbeat_timeout * 0.8  # 降低阈值，更早触发重连
             
-            # 判断是否需要重连
             if not_living_interval > threshold:
-                self._logger.warning(f"<{self._service_id}> 心跳超时 {not_living_interval:.2f}秒 > {threshold:.2f}秒，触发重连")
+                # 如果当前正在处理请求，延长超时时间
+                if len(self._pending_tasks) > 0:
+                    # 处理请求时允许更长的心跳超时
+                    if not_living_interval <= threshold * 3:
+                        continue
+                self._logger.warning(f"心跳超时 {not_living_interval:.2f}秒 > {threshold:.2f}秒，触发重连")
                 await self._do_reconnect()
 
     # 集中管理心跳状态的新方法
     def _update_heartbeat_status(self, status=True, message_type=None):
-        """改进的心跳状态更新"""
+        """心跳状态更新 - 增加主动重连触发"""
         now = time.time()
         
-        # 保留最少数量的历史记录，只用于诊断
+        # 保留历史记录
         if len(self._heartbeat_history) > 20:
             self._heartbeat_history = self._heartbeat_history[-10:]
         self._heartbeat_history.append({"time": now, "type": message_type, "status": status})
@@ -750,15 +766,15 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             self._heartbeat_status = True
             self._last_successful_heartbeat = now
         else:
-            # 新增：明确记录心跳失败状态
+            # 标记心跳失败状态
             self._heartbeat_status = False
-            # 不更新last_successful_heartbeat，保持上次成功时间
             
-            # 连续失败超过阈值时，可以直接触发重连
+            # 连续失败超过阈值时，主动触发重连
             failures = sum(1 for h in self._heartbeat_history[-5:] if not h.get("status", True))
             if failures >= 3 and self._state == DealerState.RUNNING:
-                self._logger.warning(f"<{self._service_id}> 连续{failures}次心跳失败，考虑主动重连")
-                # 可以在此处创建异步任务触发重连
+                self._logger.warning(f"<{self._service_id}> 连续{failures}次心跳失败，立即执行重连")
+                # 核心改进：主动创建异步任务执行重连
+                asyncio.create_task(self._do_reconnect())
         
         return status
 

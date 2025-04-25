@@ -92,6 +92,11 @@ async def clean_zmq_context(zmq_context):
         except:
             pass
 
+@pytest.fixture
+def router_address_ipc():
+    """为子进程测试提供IPC协议地址"""
+    return f"ipc:///tmp/test_router_{uuid.uuid4().hex}"
+
 class EchoService(ServiceDealer):
     """示例服务实现"""
     def __init__(
@@ -386,7 +391,7 @@ class TestLoadBalancing:
         
         # 停止第一个服务
         await service.stop()
-        await asyncio.sleep(0.1)  # 给路由器处理时间
+        await asyncio.sleep(0.3)  # 增加等待时间，确保ROUTER完成处理
         
         # 确认可以使用剩余服务
         async for response in client.stream("EchoService.echo", "test2"):
@@ -590,6 +595,7 @@ class TestReliability:
                 # 调整属性
                 self._busy_heartbeat_interval = self._busy_interval
                 self._busy_heartbeat_timeout = self._busy_timeout
+                self._CONSECUTIVE_FAILURES_THRESHOLD = 1
                 
             @service_method
             async def slow_task(self, duration: float = 0.1):
@@ -639,16 +645,16 @@ class TestReliability:
             await router.stop()
 
     @pytest.mark.asyncio
-    async def test_dealer_idle_crash_detection(self, router_address, zmq_context):
+    async def test_dealer_idle_crash_detection(self, router_address_ipc, zmq_context):
         """测试DEALER闲时心跳缺失被视为下线"""
         import multiprocessing as mp
         
-        # 创建Router，增加超时和检查频率
+        # 创建Router，使用IPC地址
         router = ServiceRouter(
-            router_address, 
+            router_address_ipc,  # 使用IPC协议
             context=zmq_context,
-            idle_heartbeat_check=0.1,    # 增加检查频率
-            heartbeat_timeout=0.2        # 增加超时时间
+            idle_heartbeat_check=0.1,
+            heartbeat_timeout=0.2
         )
         await router.start()
         
@@ -662,7 +668,7 @@ class TestReliability:
             crash_flag = mp.Event()
             dealer_process = mp.Process(
                 target=start_dealer_process,
-                args=(router_address, ready_flag, crash_flag)
+                args=(router_address_ipc, ready_flag, crash_flag)
             )
             dealer_process.start()
             
@@ -689,8 +695,8 @@ class TestReliability:
             crash_flag.set()
             await asyncio.sleep(0.2)
             
-            # 等待Router检测到心跳缺失
-            await asyncio.sleep(0.8)  # 等待足够的时间
+            # 等待Router检测到心跳缺失 - 等待至少3秒
+            await asyncio.sleep(3.5)  # 确保进行至少两次健康检查
             
             # 验证服务状态
             assert (service_id not in router._services or 
