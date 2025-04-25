@@ -127,14 +127,13 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         router_address: str,
         context: Optional[zmq.asyncio.Context] = None,
         hwm: int = 1000,        # 网络层面的背压控制
-        max_concurrent: int = 100,  # 应用层面的背压控制
         group: str = None,
         service_name: str = None,
-        heartbeat_interval: float = 0.5,
-        heartbeat_timeout: float = 5.0,
+        heartbeat_interval: float = 0.5,   # 闲时心跳间隔
+        heartbeat_timeout: float = 5.0,    # 闲时心跳超时
         service_id: str = None,
-        api_key: str = None,     # 新增: API密钥
-        port: int = None,        # 新增: 服务端口
+        api_key: str = None,     # API密钥
+        port: int = None,        # 服务端口
         logger_level: int = logging.INFO,
         disable_reconnect: bool = False,
         max_consecutive_reconnects=5,
@@ -144,7 +143,6 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
     ):
         self._router_address = router_address
         self._hwm = hwm
-        self._max_concurrent = max_concurrent
         self._logger = logging.getLogger(__name__)
         self._logger.setLevel(logger_level)
         self._service_name = service_name or self.__class__.__name__
@@ -152,17 +150,21 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         # 记录是否需要自行创建context
         self._context = context or zmq.asyncio.Context()
         self._socket = None
-        self._semaphore = None
-        self._current_load = 0
-        self._is_overload = False
-        self._heartbeat_interval = heartbeat_interval
-        self._heartbeat_timeout = heartbeat_timeout
+        self._idle_heartbeat_interval = heartbeat_interval
+        self._idle_heartbeat_timeout = heartbeat_timeout
+        self._busy_heartbeat_interval = 2.0    # 忙时心跳间隔，较长
+        self._busy_heartbeat_timeout = 10.0    # 忙时心跳超时，较长
+        
+        # 当前使用的参数，初始为闲时参数
+        self._heartbeat_interval = self._idle_heartbeat_interval
+        self._heartbeat_timeout = self._idle_heartbeat_timeout
+        
         self._group = group or self._service_name
 
         self._heartbeat_task = None
         self._process_messages_task = None
         self._reconnect_monitor_task = None
-        self._pending_tasks = set({})
+        self._pending_tasks = set({})  # 保留，用于任务生命周期管理
         
         # 从类注册表中复制服务方法到实例
         self._handlers = {}
@@ -177,7 +179,6 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
 
         # 状态管理
         self._state = DealerState.INIT
-        self._state_lock = asyncio.Lock()  # 状态锁
         self._reconnect_in_progress = False
         
         # 心跳状态
@@ -187,7 +188,6 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         self._consecutive_reconnects = 0  # 连续重连次数
         self._last_reconnect_time = 0  # 上次重连时间
         self._max_consecutive_reconnects = max_consecutive_reconnects  # 最大连续重连次数
-        self._connection_state = "INIT"  # 连接状态: INIT, CONNECTED, RECONNECTING, PROTECTED
         self._heartbeat_ack_count = 0  # 心跳确认计数
         
         # 重连保护锁和同步变量
@@ -237,104 +237,88 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         self._heartbeat_ack_count = 0
         self._heartbeat_status = True
 
-    async def _reconnect(self):
-        """重新连接到路由器 - 修复清理顺序"""
-        if self._connection_state == "PROTECTED":
-            self._logger.info(f"<{self._service_id}> 处于重连保护期，跳过重连")
-            return False
-
-        self._logger.info(f"<{self._service_id}> 开始执行重连...")
-
-        try:
-            # 1. 先关闭旧 Socket
-            if self._socket and not self._socket.closed:
-                 self._logger.info(f"<{self._service_id}> Closing existing socket before reconnecting...")
-                 try:
-                     self._socket.close(linger=0)
-                 except Exception as close_err:
-                     self._logger.warning(f"<{self._service_id}> Error closing socket in _reconnect: {close_err}")
-                 finally:
-                    self._socket = None
-
-            # 2. 只取消现有任务，不再等待
-            if self._process_messages_task and not self._process_messages_task.done():
-                self._logger.info(f"<{self._service_id}> Cancelling _process_messages_task in _reconnect (NO AWAIT)...")
-                self._process_messages_task.cancel()
-                # 只取消，不 await，直接将引用置空
-                self._process_messages_task = None
-
-            # ... (更新状态, 创建信号量, 创建并连接新 socket 等) ...
-            self._consecutive_reconnects += 1
-            self._last_reconnect_time = time.time()
-            self._connection_state = "RECONNECTING"
-            self._service_registered = False
-            self._semaphore = asyncio.Semaphore(self._max_concurrent)
-
-            self._logger.info(f"<{self._service_id}> Creating and connecting new socket...")
-            self._socket = self._context.socket(zmq.DEALER)
-            self._socket.identity = self._service_id.encode()
-            self._socket.set_hwm(self._hwm)
-            self._socket.setsockopt(zmq.LINGER, 0)
-            self._socket.setsockopt(zmq.IMMEDIATE, 1)
-            self._socket.connect(self._router_address)
-
-            # 在创建新socket后设置CURVE
-            if self._use_curve and self._curve_server_key:
-                # 需要确保每次重连时使用相同客户端密钥(可选)
-                if hasattr(self, '_curve_client_keypair'):
-                    client_public, client_secret = self._curve_client_keypair
-                else:
-                    if hasattr(self, '_curve_client_key_file') and os.path.exists(self._curve_client_key_file):
-                        client_public, client_secret = zmq.auth.load_certificate(self._curve_client_key_file)
+    async def _do_reconnect(self):
+        """合并重连流程为一个函数"""
+        # 使用锁防止并发重连
+        async with self._reconnect_lock:
+            if self._state == DealerState.RECONNECTING:
+                return False
+            
+            self._state = DealerState.RECONNECTING
+            
+            try:
+                # 1. 关闭现有连接
+                if self._socket and not self._socket.closed:
+                    try:
+                        self._socket.close(linger=0)
+                    except Exception as e:
+                        self._logger.warning(f"关闭socket错误: {e}")
+                    finally:
+                        self._socket = None
+                    
+                # 2. 取消消息处理任务
+                if self._process_messages_task and not self._process_messages_task.done():
+                    self._process_messages_task.cancel()
+                    self._process_messages_task = None
+                    
+                # 3. 创建新连接
+                self._consecutive_reconnects += 1
+                self._socket = self._context.socket(zmq.DEALER)
+                self._socket.identity = self._service_id.encode()
+                self._socket.set_hwm(self._hwm)
+                self._socket.setsockopt(zmq.LINGER, 0)
+                self._socket.connect(self._router_address)
+                
+                # 4. 设置CURVE加密 (如果需要)
+                if self._use_curve and self._curve_server_key:
+                    # 需要确保每次重连时使用相同客户端密钥(可选)
+                    if hasattr(self, '_curve_client_keypair'):
+                        client_public, client_secret = self._curve_client_keypair
                     else:
-                        client_public, client_secret = zmq.curve_keypair()
-                        # 存储密钥对以便重用
-                        self._curve_client_keypair = (client_public, client_secret)
+                        if hasattr(self, '_curve_client_key_file') and os.path.exists(self._curve_client_key_file):
+                            client_public, client_secret = zmq.auth.load_certificate(self._curve_client_key_file)
+                        else:
+                            client_public, client_secret = zmq.curve_keypair()
+                            # 存储密钥对以便重用
+                            self._curve_client_keypair = (client_public, client_secret)
+                    
+                    # 应用CURVE设置
+                    self._socket.curve_secretkey = client_secret
+                    self._socket.curve_publickey = client_public
+                    self._socket.curve_serverkey = self._curve_server_key
+                    
+                    self._logger.info(f"重连时启用CURVE加密")
                 
-                # 应用CURVE设置
-                self._socket.curve_secretkey = client_secret
-                self._socket.curve_publickey = client_public
-                self._socket.curve_serverkey = self._curve_server_key
+                # 5. 更新连接状态
+                self._last_successful_heartbeat = time.time()
+                backoff = min(3600, 5 * (2 ** min(10, self._consecutive_reconnects - 1)))
+                self._reconnect_protected_until = time.time() + backoff
                 
-                self._logger.info(f"重连时启用CURVE加密")
-
-            now = time.time()
-            self._update_heartbeat_status(True, "reconnect")
-            self._heartbeat_ack_count = 0
-            self._logger.info(f"<{self._service_id}> 重连成功")
-            self._connection_state = "CONNECTED"
-            # ... (记录历史, 设置保护期) ...
-            backoff_seconds = min(3600, 5 * (2 ** min(10, self._consecutive_reconnects - 1)))
-            self._reconnect_protected_until = now + backoff_seconds
-
-            # 创建新的消息处理任务
-            self._logger.info(f"<{self._service_id}> Starting new _process_messages task after reconnect.")
-            self._process_messages_task = asyncio.create_task(
-                self._process_messages(),
-                name=f"{self._service_id}-process_messages"
-            )
-
-            # 立即进行服务注册
-            await self._register_to_router()
-
-            return True
-
-        except Exception as e:
-            self._logger.error(f"<{self._service_id}> 重连过程中发生错误: {e}", exc_info=True)
-            self._diagnostics["last_error"] = str(e)
-            return False
+                # 6. 创建新任务并注册
+                self._process_messages_task = asyncio.create_task(
+                    self._process_messages(), 
+                    name=f"{self._service_id}-process_messages"
+                )
+                await self._register_to_router()
+                
+                self._state = DealerState.RUNNING
+                return True
+                
+            except Exception as e:
+                self._logger.error(f"重连失败: {e}")
+                self._state = DealerState.INIT  # 重置状态
+                return False
 
     async def start(self):
         """启动服务"""
-        async with self._state_lock:
-            if self._state not in [DealerState.INIT, DealerState.STOPPED]:
-                self._logger.warning(f"<{self._service_id}> Cannot start from {self._state} state")
-                return False
-                
-            self._state = DealerState.RUNNING
+        if self._state not in [DealerState.INIT, DealerState.STOPPED]:
+            self._logger.warning(f"<{self._service_id}> Cannot start from {self._state} state")
+            return False
+            
+        self._state = DealerState.RUNNING
 
         # 重建连接
-        if not await self._reconnect():
+        if not await self._do_reconnect():
             self._logger.error(f"<{self._service_id}> 网络连接失败")
             return False
 
@@ -351,11 +335,10 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
 
     async def stop(self):
         """停止服务"""
-        async with self._state_lock:
-            if self._state == DealerState.STOPPED:
-                return
-                
-            self._state = DealerState.STOPPING
+        if self._state == DealerState.STOPPED:
+            return
+            
+        self._state = DealerState.STOPPING
         
         # 主动通知Router服务下线（添加超时保护）
         try:
@@ -436,14 +419,10 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                     'metadata': info.get('metadata', {})
                 }
             
-            # 构建服务信息
+            # 构建服务信息，移除处理能力相关字段
             service_info = {
                 "group": self._group or self._service_name,
                 "methods": serializable_methods,  # 使用可序列化的方法信息
-                "max_concurrent": self._max_concurrent,
-                "current_load": self._current_load,
-                "request_count": 0,
-                "reply_count": 0,
                 "api_key": self._api_key,
                 "remote_addr": remote_addr,
                 "host_info": {
@@ -473,7 +452,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             self._logger.error(f"<{self._service_id}> Registration failed: {str(e)}", exc_info=True)
 
     async def _process_messages(self):
-        """处理消息主循环 - 强化版"""
+        """处理消息主循环 - 增强版"""
         last_diagnostics_time = time.time()
         error_count = 0
         
@@ -488,19 +467,22 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                     self._logger.warning(f"<{self._service_id}> 消息处理发现socket已关闭或为None，中止")
                     break
                 
-                # 尝试接收消息
+                # 尝试接收消息，使用较短的超时时间
                 try:
                     multipart = await asyncio.wait_for(
                         self._socket.recv_multipart(),
-                        timeout=max(3.0, self._heartbeat_interval * 6)
+                        timeout=min(2.0, self._heartbeat_interval * 3)  # 缩短超时时间
                     )
                 except asyncio.TimeoutError:
-                    if error_count % 10 == 0:  # 仅每10次超时记录一次，避免日志过多
-                        self._logger.warning(f"<{self._service_id}> 接收消息超时")
+                    # 重要改动：超时时主动更新心跳状态为失败
                     error_count += 1
+                    if error_count >= 2:  # 连续2次超时触发心跳状态更新
+                        self._update_heartbeat_status(False, "timeout")
+                        if error_count % 5 == 0:  # 每5次超时记录一次日志
+                            self._logger.warning(f"<{self._service_id}> 接收消息连续{error_count}次超时，可能连接已断开")
                     continue
-                    
-                # 重置错误计数
+                
+                # 收到消息，重置错误计数
                 error_count = 0
                 
                 # 增加收到消息计数，用于诊断
@@ -550,6 +532,11 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                     error_message = multipart[1].decode() if len(multipart) > 1 else "Unknown error"
                     self._logger.error(f"<{self._service_id}> error: {error_message}")
 
+                elif message_type == b"router_shutdown":
+                    self._logger.info(f"<{self._service_id}> Router主动通知关闭，准备重连")
+                    self._state = DealerState.RECONNECTING
+                    asyncio.create_task(self._do_reconnect())
+
                 else:
                     self._logger.error(f"<{self._service_id}> DEALER Received unknown message type: {message_type}")
 
@@ -568,119 +555,89 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
     async def _process_request(self, target_client_id: bytes, request: dict):
         """处理单个请求"""
         self._logger.info(f"<{self._service_id}> DEALER Processing request: {request}")
-        if self._current_load >= self._max_concurrent:
-            await self._send_error(
-                target_client_id,
-                "Service overloaded"
-            )
-            self._logger.info(f"<{self._service_id}> DEALER Service overloaded, rejecting request from {self._service_id}")
-            return
-
+        
         try:
-            # 防止信号量为None导致崩溃
-            if not hasattr(self, '_semaphore') or self._semaphore is None:
-                self._logger.warning(f"<{self._service_id}> 处理请求前信号量为None，重新创建")
-                self._semaphore = asyncio.Semaphore(self._max_concurrent)
-            
-            async with self._semaphore:
-                self._current_load += 1
-                
-                # 检查是否需要报告即将满载
-                if not self._is_overload and self.check_overload():
-                    self._is_overload = True
-                    await self._socket.send_multipart([b"overload", b""])
-                
-                try:
-                    # 检查方法是否注册过
-                    func_name = request.get("func_name", "").split('.')[-1]
-                    if func_name in self._handlers:
-                        handler = self._handlers[func_name]['handler']
-                        handler_info = self._registry[func_name]
-                        is_stream = handler_info['stream']
-                        is_coroutine = handler_info['is_coroutine']
+            # 检查方法是否注册过
+            func_name = request.get("func_name", "").split('.')[-1]
+            if func_name in self._handlers:
+                handler = self._handlers[func_name]['handler']
+                handler_info = self._registry[func_name]
+                is_stream = handler_info['stream']
+                is_coroutine = handler_info['is_coroutine']
+            else:
+                await self._send_error(
+                    target_client_id,
+                    f"Method {request.get('func_name')} not found"
+                )
+                return
+
+            try:
+                if is_stream:
+                    self._logger.info(f"<{self._service_id}> Streaming response for {request.get('func_name')}")
+                    # 处理流式响应
+                    async for chunk in handler(*request.get("args", []), **request.get("kwargs", {})):
+                        # 将Pydantic模型转换为字典
+                        if isinstance(chunk, BaseModel):
+                            chunk = chunk.model_dump()
+                        
+                        # 创建流式响应消息
+                        message = {
+                            "type": "streaming",
+                            "request_id": request.get("request_id"),
+                            "data": chunk
+                        }
+
+                        await self._socket.send_multipart([
+                            b"reply_from_dealer",
+                            target_client_id,
+                            json.dumps(message).encode()
+                        ])
+                    
+                    # 发送结束标记
+                    end_message = {
+                        "type": "end",
+                        "request_id": request.get("request_id")
+                    }
+                    await self._socket.send_multipart([
+                        b"reply_from_dealer",
+                        target_client_id,
+                        json.dumps(end_message).encode()
+                    ])
+                else:
+                    # 处理普通响应
+                    if is_coroutine:
+                        result = await handler(*request.get("args", []), **request.get("kwargs", {}))
                     else:
-                        await self._send_error(
-                            target_client_id,
-                            f"Method {request.get('func_name')} not found"
-                        )
-                        return
+                        result = handler(*request.get("args", []), **request.get("kwargs", {}))
 
-                    try:
-                        if is_stream:
-                            self._logger.info(f"<{self._service_id}> Streaming response for {request.get('func_name')}")
-                            # 处理流式响应
-                            async for chunk in handler(*request.get("args", []), **request.get("kwargs", {})):
-                                # 将Pydantic模型转换为字典
-                                if isinstance(chunk, BaseModel):
-                                    chunk = chunk.model_dump()
-                                
-                                # 创建流式响应消息
-                                message = {
-                                    "type": "streaming",
-                                    "request_id": request.get("request_id"),
-                                    "data": chunk
-                                }
-
-                                await self._socket.send_multipart([
-                                    b"reply_from_dealer",
-                                    target_client_id,
-                                    json.dumps(message).encode()
-                                ])
-                            
-                            # 发送结束标记
-                            end_message = {
-                                "type": "end",
-                                "request_id": request.get("request_id")
-                            }
-                            await self._socket.send_multipart([
-                                b"reply_from_dealer",
-                                target_client_id,
-                                json.dumps(end_message).encode()
-                            ])
-                        else:
-                            # 处理普通响应
-                            if is_coroutine:
-                                result = await handler(*request.get("args", []), **request.get("kwargs", {}))
-                            else:
-                                result = handler(*request.get("args", []), **request.get("kwargs", {}))
-
-                            # 将Pydantic模型转换为字典
-                            if isinstance(result, BaseModel):
-                                result = result.model_dump()
-                                
-                            # 创建响应消息
-                            reply = {
-                                "type": "reply",
-                                "request_id": request.get("request_id"),
-                                "result": result
-                            }
-                                
-                            await self._socket.send_multipart([
-                                b"reply_from_dealer",
-                                target_client_id,
-                                json.dumps(reply).encode()
-                            ])
-                    except zmq.ZMQError as e:
-                        self._logger.error(f"<{self._service_id}> DEALER ZMQError: {e}")
-                        await asyncio.sleep(2)
-                    except Exception as e:
-                        self._logger.error(f"<{self._service_id}> DEALER Handler error: {e}", exc_info=True)
-                        # 向客户端发送错误响应
-                        await self._send_error(
-                            target_client_id,
-                            f"Method execution error: {str(e)}"
-                        )
-                except Exception as e:
-                    self._logger.error(f"<{self._service_id}> DEALER Request processing error: {e}", exc_info=True)
-        finally:
-            self._current_load -= 1
-            if self._current_load < 0:
-                self._current_load = 0
-            
-            # 检查是否可以恢复服务
-            if self._is_overload and self.check_can_resume():
-                self._is_overload = False
-                await self._socket.send_multipart([b"resume", b""])
+                    # 将Pydantic模型转换为字典
+                    if isinstance(result, BaseModel):
+                        result = result.model_dump()
+                        
+                    # 创建响应消息
+                    reply = {
+                        "type": "reply",
+                        "request_id": request.get("request_id"),
+                        "result": result
+                    }
+                        
+                    await self._socket.send_multipart([
+                        b"reply_from_dealer",
+                        target_client_id,
+                        json.dumps(reply).encode()
+                    ])
+            except zmq.ZMQError as e:
+                self._logger.error(f"<{self._service_id}> DEALER ZMQError: {e}")
+                await asyncio.sleep(2)
+            except Exception as e:
+                self._logger.error(f"<{self._service_id}> DEALER Handler error: {e}", exc_info=True)
+                # 向客户端发送错误响应
+                await self._send_error(
+                    target_client_id,
+                    f"Method execution error: {str(e)}"
+                )
+        except Exception as e:
+            self._logger.error(f"<{self._service_id}> DEALER Request processing error: {e}", exc_info=True)
 
     async def _send_error(self, target_client_id: bytes, error_msg: str):
         """发送错误响应"""
@@ -694,211 +651,114 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             json.dumps(error).encode()
         ])
 
+    async def _update_busy_state(self):
+        """根据当前任务数更新忙/闲状态"""
+        is_busy = len(self._pending_tasks) > 0
+        
+        # 根据状态调整心跳参数
+        if is_busy and self._heartbeat_interval != self._busy_heartbeat_interval:
+            self._heartbeat_interval = self._busy_heartbeat_interval
+            self._heartbeat_timeout = self._busy_heartbeat_timeout
+            self._logger.debug(f"<{self._service_id}> 切换到忙时心跳模式: 间隔={self._heartbeat_interval}秒, 超时={self._heartbeat_timeout}秒")
+        elif not is_busy and self._heartbeat_interval != self._idle_heartbeat_interval:
+            self._heartbeat_interval = self._idle_heartbeat_interval
+            self._heartbeat_timeout = self._idle_heartbeat_timeout
+            self._logger.debug(f"<{self._service_id}> 切换到闲时心跳模式: 间隔={self._heartbeat_interval}秒, 超时={self._heartbeat_timeout}秒")
+        
+        return is_busy
+
     async def _heartbeat_loop(self):
-        """改进的心跳和健康监控循环"""
-        heartbeat_count = 0
-        heartbeat_misses = 0
+        """简化后的心跳循环"""
+        last_heartbeat_time = time.time()
         
         while self._state == DealerState.RUNNING:
             try:
-                # 发送心跳
-                if self._socket and self._state == DealerState.RUNNING:
-                    # 在心跳中包含更多诊断信息
+                current_time = time.time()
+                is_busy = len(self._pending_tasks) > 0
+                
+                # 动态调整心跳参数
+                self._heartbeat_interval = self._busy_heartbeat_interval if is_busy else self._idle_heartbeat_interval
+                self._heartbeat_timeout = self._busy_heartbeat_timeout if is_busy else self._idle_heartbeat_timeout
+                
+                # 判断是否需要发送心跳 - 简化判断逻辑
+                elapsed = current_time - last_heartbeat_time
+                if (elapsed >= self._heartbeat_interval or 
+                    current_time - self._last_successful_heartbeat > self._heartbeat_timeout):
+                    
+                    # 心跳数据精简
                     heartbeat_data = {
                         "api_key": self._api_key,
-                        "processing_requests": self._current_load,
-                        "dealer_info": {
-                            "service_name": self._service_name,
-                            "group": self._group,
-                            "pid": os.getpid(),
-                            "heartbeat_count": heartbeat_count,
-                            "connection_state": self._connection_state
-                        }
+                        "processing_requests": len(self._pending_tasks),
+                        "is_busy": is_busy
                     }
                     
-                    await self._socket.send_multipart([
-                        b"heartbeat", 
-                        json.dumps(heartbeat_data).encode()
-                    ])
-                    heartbeat_count += 1
-                    self._diagnostics["sent_messages"] += 1
-                    
-                    # 检查最近是否收到过心跳响应
-                    elapsed = time.time() - self._last_successful_heartbeat
-                    if elapsed > self._heartbeat_interval * 3:
-                        heartbeat_misses += 1
-                        if heartbeat_misses >= 3:
-                            self._logger.warning(f"<{self._service_id}> 已连续 {heartbeat_misses} 次未收到心跳确认")
-                    else:
-                        # 重置计数
-                        heartbeat_misses = 0
+                    if self._socket and not self._socket.closed:
+                        await self._socket.send_multipart([
+                            b"heartbeat", 
+                            json.dumps(heartbeat_data).encode()
+                        ])
+                        last_heartbeat_time = current_time
+                        
+                    # 未注册时尝试注册
+                    if not self._service_registered:
+                        await self._register_to_router()
                 
-                # 如果服务未注册，尝试注册
-                if not self._service_registered:
-                    await self._register_to_router()
+                # 简化睡眠时间计算
+                await asyncio.sleep(min(0.2, self._heartbeat_interval / 4))
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self._logger.error(f"<{self._service_id}> Error in heartbeat loop: {e}")
-                self._diagnostics["last_error"] = str(e)
-                await asyncio.sleep(2)
-            finally:
-                await asyncio.sleep(self._heartbeat_interval)
-
-    async def request_reconnect(self):
-        """请求重连 - 修复清理顺序"""
-        # 使用锁防止并发重连操作
-        async with self._reconnect_lock:
-            self._logger.debug(f"<{self._service_id}> Inside request_reconnect lock")
-            # 已经在重连中或保护期内，则跳过
-            if self._connection_state == "RECONNECTING" or time.time() < self._reconnect_protected_until:
-                self._logger.info(f"<{self._service_id}> Skipping reconnect request. State: {self._connection_state}, Protected until: {self._reconnect_protected_until}")
-                return
-
-            self._connection_state = "RECONNECTING"
-            now = time.time()
-            # ... (记录连接历史等) ...
-
-            # 1. 先关闭旧 Socket
-            if self._socket and not self._socket.closed:
-                self._logger.info(f"<{self._service_id}> Closing existing socket in request_reconnect...")
-                try:
-                    self._socket.close(linger=0) # 确保快速关闭
-                except Exception as close_err:
-                    self._logger.warning(f"<{self._service_id}> Error closing socket in request_reconnect: {close_err}")
-                finally:
-                    self._socket = None
-            self._service_registered = False # 标记需要重新注册
-
-            # 2. 只取消旧的消息处理任务，不再等待
-            if self._process_messages_task and not self._process_messages_task.done():
-                self._logger.info(f"<{self._service_id}> Cancelling _process_messages_task in request_reconnect (NO AWAIT)...")
-                self._process_messages_task.cancel()
-                # 只取消，不 await，直接将引用置空
-                self._process_messages_task = None
-
-            self._logger.debug(f"<{self._service_id}> Exiting request_reconnect lock")
+                self._logger.error(f"<{self._service_id}> 心跳错误: {e}")
+                await asyncio.sleep(1)  # 错误后短暂等待
 
     async def _reconnect_monitor(self):
-        """监控并处理重连请求 - 完全重构版"""        
-        self._logger.info(f"<{self._service_id}> 重连监控器已启动")
-        
-        # 禁用重连选项（测试用）
+        """增强的重连监控"""
         if self._disable_reconnect:
-            self._logger.warning(f"重连监控已被禁用（仅用于测试）")
-            while self._state == DealerState.RUNNING:
-                await asyncio.sleep(10.0)
             return
         
-        # 主循环
-        last_check_time = time.time()
-        
         while self._state == DealerState.RUNNING:
-            check_interval = self._heartbeat_timeout / 3.0
-            check_interval = max(0.1, check_interval) # 最小检查间隔 100ms
+            # 更短的检查间隔，提高敏感度
+            check_interval = min(0.5, self._heartbeat_interval / 2)
             await asyncio.sleep(check_interval)
             
-            current_time = time.time()
-            check_interval = current_time - last_check_time
-            last_check_time = current_time
-            
-            # 检查是否处于重连保护期
-            if current_time < self._reconnect_protected_until:
-                if (current_time - last_check_time) > self._heartbeat_timeout:
-                    self._logger.info(f"<{self._service_id}> 重连保护期内，剩余 "
-                                     f"{int(self._reconnect_protected_until - current_time)} 秒")
+            # 跳过保护期和进行中的重连
+            if time.time() < self._reconnect_protected_until or self._state == DealerState.RECONNECTING:
                 continue
             
-            # 正在进行的重连操作
-            if self._connection_state == "RECONNECTING":
-                continue
+            # 简化心跳超时判断
+            not_living_interval = time.time() - self._last_successful_heartbeat
+            threshold = self._heartbeat_timeout * 0.8  # 提前触发重连
             
-            # 心跳超时检测
-            not_living_interval = current_time - self._last_successful_heartbeat
-            
-            # 渐进式超时检测：根据连续重连次数增加宽容度
-            timeout_threshold = self._heartbeat_timeout * (1 + 0.5 * min(5, self._consecutive_reconnects))
-            
-            # 如果超时，需要重连
-            if not_living_interval > timeout_threshold:
-                # 首先，确认这不是误报
-                if self._connection_state == "CONNECTED" and self._consecutive_reconnects > 3:
-                    # 对于已经连续重连多次的情况，采用更严格的超时检测
-                    confirmation_timeout = timeout_threshold * 1.5
-                    self._logger.warning(f"<{self._service_id}> 检测到潜在心跳超时 ({not_living_interval:.1f}秒)，"
-                                       f"等待确认 ({confirmation_timeout-not_living_interval:.1f}秒后再决定)")
-                    
-                    # 简单等待一段时间再次确认，避免误判
-                    await asyncio.sleep(confirmation_timeout - not_living_interval)
-                    
-                    # 再次检查，如果依然超时，才真正触发重连
-                    current_not_living = time.time() - self._last_successful_heartbeat
-                    if current_not_living <= timeout_threshold:
-                        self._logger.info(f"<{self._service_id}> 心跳已恢复，取消重连")
-                        continue
-                
-                # 执行重连
-                self._logger.debug(f"<{self._service_id}> 已获取重连锁")
-                if self._connection_state != "RECONNECTING" and current_time >= self._reconnect_protected_until:
-                    self._logger.warning(f"<{self._service_id}> 心跳超时 ({not_living_interval:.1f}秒 > {timeout_threshold:.1f}秒)，触发重连")
-
-                    try:
-                        self._logger.info(f"<{self._service_id}> 调用 request_reconnect...")
-                        await self.request_reconnect()
-                        self._logger.info(f"<{self._service_id}> request_reconnect 调用完成")
-
-                        self._logger.info(f"<{self._service_id}> 调用 _reconnect...")
-                        if await self._reconnect():
-                            self._logger.info(f"<{self._service_id}> _reconnect 调用成功，准备重启消息处理和注册")
-                        else:
-                            self._logger.error(f"<{self._service_id}> _reconnect 调用失败")
-                            self._network_failures += 1
-                    except Exception as e:
-                        self._logger.error(f"<{self._service_id}> 在重连监控器中执行重连步骤时发生异常: {e}", exc_info=True)
-
-                else:
-                    # 添加日志，说明为什么跳过了实际重连步骤
-                    self._logger.info(f"<{self._service_id}> 获取锁后跳过重连，当前状态: {self._connection_state}, 保护期到: {self._reconnect_protected_until}")
-
-    def check_overload(self) -> bool:
-        """检查是否接近满载（可重写）
-        默认策略：当前负载达到最大并发的90%时认为即将满载
-        """
-        return self._current_load >= self._max_concurrent * 0.9
-
-    def check_can_resume(self) -> bool:
-        """检查是否可以恢复服务（可重写）
-        默认策略：当前负载低于最大并发的80%时可以恢复
-        """
-        return self._current_load <= self._max_concurrent * 0.8
+            # 判断是否需要重连
+            if not_living_interval > threshold:
+                self._logger.warning(f"<{self._service_id}> 心跳超时 {not_living_interval:.2f}秒 > {threshold:.2f}秒，触发重连")
+                await self._do_reconnect()
 
     # 集中管理心跳状态的新方法
     def _update_heartbeat_status(self, status=True, message_type=None):
-        """集中式更新心跳状态"""
+        """改进的心跳状态更新"""
         now = time.time()
         
-        # 记录心跳历史
-        self._heartbeat_history.append({
-            "time": now,
-            "status": status,
-            "message_type": message_type,
-        })
-        
-        # 只保留最近的50条记录
-        if len(self._heartbeat_history) > 50:
-            self._heartbeat_history = self._heartbeat_history[-50:]
+        # 保留最少数量的历史记录，只用于诊断
+        if len(self._heartbeat_history) > 20:
+            self._heartbeat_history = self._heartbeat_history[-10:]
+        self._heartbeat_history.append({"time": now, "type": message_type, "status": status})
         
         # 更新状态
         if status:
-            # 成功收到心跳或其他消息
             self._heartbeat_status = True
             self._last_successful_heartbeat = now
+        else:
+            # 新增：明确记录心跳失败状态
+            self._heartbeat_status = False
+            # 不更新last_successful_heartbeat，保持上次成功时间
             
-            # 如果之前有连续重连，现在重置
-            if self._consecutive_reconnects > 0:
-                self._logger.info(f"<{self._service_id}> 连接恢复稳定，重置连续重连计数")
-                self._consecutive_reconnects = 0
+            # 连续失败超过阈值时，可以直接触发重连
+            failures = sum(1 for h in self._heartbeat_history[-5:] if not h.get("status", True))
+            if failures >= 3 and self._state == DealerState.RUNNING:
+                self._logger.warning(f"<{self._service_id}> 连续{failures}次心跳失败，考虑主动重连")
+                # 可以在此处创建异步任务触发重连
         
         return status
 

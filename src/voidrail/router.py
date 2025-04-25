@@ -246,7 +246,24 @@ class ServiceRouter:
                 return
                 
             self._state = RouterState.STOPPING
-
+        
+        # 新增：向所有DEALER发送关闭通知
+        try:
+            for service_id in self._services.keys():
+                try:
+                    await asyncio.wait_for(
+                        self._socket.send_multipart([
+                            service_id.encode(),
+                            b"router_shutdown",
+                            b""
+                        ]),
+                        timeout=0.2
+                    )
+                except Exception as e:
+                    self._logger.warning(f"通知服务{service_id}关闭失败: {e}")
+        except Exception as e:
+            self._logger.error(f"发送关闭通知出错: {e}")
+        
         tasks = []
         if self._message_task:
             self._message_task.cancel()
