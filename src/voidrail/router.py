@@ -33,16 +33,10 @@ class ServiceInfo(BaseModel):
     group: str = Field(default="default")
     methods: Dict[str, Any]
     state: ServiceState = ServiceState.ACTIVE
-    max_concurrent: int = 100
     current_load: int = 0
     request_count: int = 0
     reply_count: int = 0
     last_heartbeat: float = Field(default_factory=time)
-
-    @property
-    def load_ratio(self) -> float:
-        """负载率"""
-        return self.current_load / self.max_concurrent
 
     def accept_request(self):
         """接受请求"""
@@ -70,8 +64,7 @@ class ServiceRouter:
         self, 
         address: str, 
         context: Optional[zmq.asyncio.Context] = None,
-        heartbeat_timeout: float = 30.0,       # 空闲状态超时时间（秒）
-        idle_heartbeat_check: float = 10.0,    # 空闲状态心跳检查间隔（秒）
+        heartbeat_interval: float = 1.0,  # 用户唯一需配置的心跳"检查"周期
         hwm: int = 1000,
         dealer_api_keys: List[str] = None,     # DEALER 端 API 密钥列表
         client_api_keys: List[str] = None,     # CLIENT 端 API 密钥列表
@@ -88,11 +81,20 @@ class ServiceRouter:
         self._logger = logging.getLogger(__name__)
         self._logger.setLevel(logger_level)
         
-        # 差异化超时配置
-        self._IDLE_HEARTBEAT_TIMEOUT = heartbeat_timeout         # 空闲状态超时认定时间
-        self._IDLE_HEARTBEAT_CHECK = idle_heartbeat_check           # 检查间隔
-        self._BUSY_HEARTBEAT_TIMEOUT = heartbeat_timeout * 60   # 忙碌状态超时(60倍空闲超时)
-        self._MAX_BUSY_WITHOUT_HEARTBEAT = self._BUSY_HEARTBEAT_TIMEOUT * 2  # 忙碌最大无心跳时间
+        # 基准心跳检查周期
+        I = heartbeat_interval
+
+        # 空闲服务判定超时 = I + 3
+        T_idle = I + 3
+        # 心跳健康检查间隔 = I
+        check_interval = I
+
+        # 忙碌服务可以设更宽松
+        T_busy = T_idle * 60
+
+        self._IDLE_HEARTBEAT_TIMEOUT = T_idle
+        self._IDLE_HEARTBEAT_CHECK   = check_interval
+        self._BUSY_HEARTBEAT_TIMEOUT = T_busy
         
         # 状态管理
         self._state = RouterState.INIT
@@ -343,7 +345,6 @@ class ServiceRouter:
             self._logger.warning(f"服务注册认证失败: {service_id}, 提供的 DEALER API 密钥无效")
             return False
 
-        max_concurrent = service_info.get('max_concurrent', 100)
         methods = {
             f"{service_info.get('group', 'default')}.{name}": info
             for name, info in service_info.get('methods', {}).items()
@@ -370,16 +371,15 @@ class ServiceRouter:
             service_id=service_id,
             group=service_info.get('group', 'default'),
             methods=methods,
-            max_concurrent=max_concurrent,
             current_load=service_info.get('current_load', 0),
             request_count=service_info.get('request_count', 0),
             reply_count=service_info.get('reply_count', 0)
         )
 
         if is_reconnect:
-            self._logger.info(f"Reconnected service: {service_id} with max_concurrent={max_concurrent}")
+            self._logger.info(f"Reconnected service: {service_id}")
         else:
-            self._logger.info(f"Registered new service: {service_id} with max_concurrent={max_concurrent}")
+            self._logger.info(f"Registered new service: {service_id}")
 
         return True # 添加明确的返回 True
 
@@ -741,7 +741,7 @@ class ServiceRouter:
                         "address": self._address,
                         "idle_heartbeat_timeout": self._IDLE_HEARTBEAT_TIMEOUT,
                         "busy_heartbeat_timeout": self._BUSY_HEARTBEAT_TIMEOUT,
-                        "max_busy_without_heartbeat": self._MAX_BUSY_WITHOUT_HEARTBEAT,
+                        "max_busy_without_heartbeat": self._BUSY_HEARTBEAT_TIMEOUT * 2,
                         "active_services_count": len([s for s in self._services.values() if s.state == ServiceState.ACTIVE]),
                         "busy_services_count": len([s for s in self._services.values() if s.state == ServiceState.ACTIVE and s.current_load > 0]),
                         "idle_services_count": len([s for s in self._services.values() if s.state == ServiceState.ACTIVE and s.current_load == 0]),
@@ -843,14 +843,14 @@ class ServiceRouter:
         self._service_heartbeat_failures = defaultdict(int)  # 记录连续心跳失败次数
         
         while self._state == RouterState.RUNNING:
-            current_time = time()
+            now = time()
             
             # 检查服务心跳
             for service_id, service in list(self._services.items()):
                 if service.state == ServiceState.SHUTDOWN:
                     continue  # 跳过已主动下线的服务
                     
-                heartbeat_age = current_time - service.last_heartbeat
+                age = now - service.last_heartbeat
                 
                 # 根据服务状态确定超时时间
                 if service.current_load > 0:
@@ -863,7 +863,7 @@ class ServiceRouter:
                     timeout = self._IDLE_HEARTBEAT_TIMEOUT
                 
                 # 检查心跳是否超时
-                if heartbeat_age > timeout:
+                if age > timeout:
                     # 增加连续失败计数
                     self._service_heartbeat_failures[service_id] += 1
                     consecutive_failures = self._service_heartbeat_failures[service_id]
@@ -875,7 +875,7 @@ class ServiceRouter:
                             self._logger.warning(
                                 f"服务 {service_id} 标记为不活跃: "
                                 f"连续 {consecutive_failures} 次心跳超时 "
-                                f"(上次心跳: {heartbeat_age:.1f}秒前, 超时阈值: {timeout:.1f}秒)"
+                                f"(上次心跳: {age:.1f}秒前, 超时阈值: {timeout:.1f}秒)"
                             )
                             service.current_load = 0
                             
@@ -885,7 +885,7 @@ class ServiceRouter:
                     else:
                         # 未达到连续失败阈值，记录警告但不改变状态
                         self._logger.info(
-                            f"服务 {service_id} 心跳延迟 ({heartbeat_age:.1f}秒), "
+                            f"服务 {service_id} 心跳延迟 ({age:.1f}秒), "
                             f"连续失败次数: {consecutive_failures}/{self._CONSECUTIVE_FAILURES_THRESHOLD}"
                         )
                 else:

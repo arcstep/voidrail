@@ -34,7 +34,6 @@ def router_address():
 def test_config():
     """测试配置"""
     return {
-        'heartbeat_timeout': 0.2,  # 缩短到100ms
         'heartbeat_interval': 0.5, # 缩短到50ms
     }
 
@@ -44,7 +43,7 @@ async def router(router_address, zmq_context, test_config):
     router = ServiceRouter(
         router_address, 
         context=zmq_context,
-        heartbeat_timeout=test_config['heartbeat_timeout']
+        heartbeat_interval=test_config['heartbeat_interval']
     )
     await router.start()
     await asyncio.sleep(0.05)
@@ -60,7 +59,6 @@ async def service(router, router_address, zmq_context, test_config):
     service = EchoService(
         router_address,
         context=zmq_context,
-        heartbeat_timeout=test_config['heartbeat_timeout'],
         heartbeat_interval=test_config['heartbeat_interval']
     )
     await service.start()
@@ -106,12 +104,9 @@ class EchoService(ServiceDealer):
         self,
         router_address: str,
         context = None,
-        heartbeat_timeout: float = 5.0, # 保持一个默认值或根据需要调整
         heartbeat_interval: float = 0.2,
         **kwargs
     ):
-        if 'heartbeat_timeout' not in kwargs:
-            kwargs['heartbeat_timeout'] = heartbeat_timeout
         if 'heartbeat_interval' not in kwargs:
             kwargs['heartbeat_interval'] = heartbeat_interval
         super().__init__(
@@ -427,9 +422,9 @@ class TestReliability:
                 service = EchoService(
                     router_address, 
                     context=zmq_context, 
-                    service_id=f"test-service-{i}",
                     heartbeat_interval=0.02  # 快速心跳
                 )
+                service._service_id = f"test-service-{i}"
                 await service.start()
                 services.append(service)
             
@@ -489,7 +484,6 @@ class TestReliability:
                 router_address, 
                 context=zmq_context,
                 heartbeat_interval=0.02,  # 更短的心跳间隔
-                heartbeat_timeout=0.1     # 更短的心跳超时
             )
             await service.start()
             await asyncio.sleep(0.2)  # 增加等待时间确保连接稳定
@@ -505,8 +499,11 @@ class TestReliability:
             router_process.terminate()
             router_process.join(timeout=0.1)
             
-            # 增加等待时间，确保有足够时间检测到崩溃
-            max_wait = 2.0  # 最长等待2秒
+            # 动态等待：以 service 的空闲超时（I+3）*0.8 + I 为阈值，确保能触发 _reconnect_monitor
+            I = service._idle_heartbeat_interval
+            T_idle = service._idle_heartbeat_timeout  # I + 3
+            # 在 0.8*T_idle + I 之内，dealer 应当检测到 router 崩溃
+            max_wait = 0.8 * T_idle + I
             detected = False
             
             while time.time() - start_time < max_wait:
@@ -519,7 +516,7 @@ class TestReliability:
                     break
             
             # 断言已检测到崩溃
-            assert detected, f"Router崩溃应在{max_wait}秒内被检测到（当前状态：{service._state}）"
+            assert detected, f"Router崩溃应在{max_wait:.2f}秒内被检测到（当前状态：{service._state}）"
         finally:
             if service:
                 await service.stop()
@@ -533,7 +530,7 @@ class TestReliability:
         router = ServiceRouter(
             router_address, 
             context=zmq_context,
-            heartbeat_timeout=0.1
+            heartbeat_interval=0.1
         )
         await router.start()
         
@@ -586,19 +583,6 @@ class TestReliability:
         """测试DEALER即使超过忙时限制，也能完成任务并正确返回结果"""
         # 修复SlowService实现
         class SlowService(ServiceDealer):
-            def __init__(self, router_address, context=None, **kwargs):
-                # 保存自定义参数
-                self._busy_interval = kwargs.pop('busy_heartbeat_interval', 0.02)
-                self._busy_timeout = kwargs.pop('busy_heartbeat_timeout', 0.2)
-                
-                # 调用父类构造函数
-                super().__init__(router_address=router_address, context=context, **kwargs)
-                
-                # 调整属性
-                self._busy_heartbeat_interval = self._busy_interval
-                self._busy_heartbeat_timeout = self._busy_timeout
-                self._CONSECUTIVE_FAILURES_THRESHOLD = 1
-                
             @service_method
             async def slow_task(self, duration: float = 0.1):
                 """模拟耗时任务"""
@@ -617,9 +601,6 @@ class TestReliability:
                 router_address, 
                 context=zmq_context,
                 heartbeat_interval=0.02,  # 原生参数
-                heartbeat_timeout=0.2,     # 原生参数
-                busy_heartbeat_interval=0.05,  # 自定义参数 
-                busy_heartbeat_timeout=0.5     # 自定义参数
             )
             await service.start()
             await asyncio.sleep(0.1)
@@ -655,8 +636,7 @@ class TestReliability:
         router = ServiceRouter(
             router_address_ipc,  # 使用IPC协议
             context=zmq_context,
-            idle_heartbeat_check=0.1,
-            heartbeat_timeout=0.2
+            heartbeat_interval=0.1,
         )
         await router.start()
         
@@ -714,11 +694,11 @@ def start_router_process(router_address, ready_flag, stop_flag):
     import asyncio
     async def _run():
         from voidrail import ServiceRouter
-        router = ServiceRouter(router_address, heartbeat_timeout=0.1)
+        router = ServiceRouter(router_address, heartbeat_interval=3)
         await router.start()
         ready_flag.set()
         while not stop_flag.is_set():
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.1)
         await router.stop()
     
     loop = asyncio.new_event_loop()
@@ -734,8 +714,8 @@ def start_dealer_process(router_address, ready_flag, crash_flag):
     # 直接在函数内定义服务类，避免导入问题
     class SimpleService(ServiceDealer):
         def __init__(self, router_address, **kwargs):
-            kwargs.setdefault('service_id', 'crash-test-service')
             super().__init__(router_address=router_address, **kwargs)
+            self._service_id = 'crash-test-service'
             
         @service_method
         async def echo(self, message):

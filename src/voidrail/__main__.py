@@ -11,7 +11,7 @@ import time
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 
-from .router import ServiceRouter, RouterMode
+from .router import ServiceRouter
 from .dealer import ServiceDealer
 from .client import ClientDealer
 from .api_key import ApiKeyManager
@@ -32,34 +32,19 @@ def cli(debug):
 @cli.command()
 @click.option('--host', '-h', default='127.0.0.1', help='路由器监听地址')
 @click.option('--port', '-p', default=5555, help='路由器监听端口')
-@click.option('--mode', type=click.Choice(['fifo', 'load_balance']), default='fifo', help='路由器分发模式')
 @click.option('--heartbeat', default=30.0, help='心跳超时时间（秒）')
-@click.option('--require-auth/--no-auth', default=False, help='是否启用认证')
 @click.option('--dealer-keys', multiple=True, help='允许的服务端API密钥 (可指定多次)')
 @click.option('--client-keys', multiple=True, help='允许的客户端API密钥 (可指定多次)')
-@click.option('--generate-keys', is_flag=True, help='生成并显示新的API密钥')
 @click.option('--logger-level', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']), default='INFO', help='日志级别')
-def router(host, port, mode, heartbeat, require_auth, dealer_keys, client_keys, generate_keys, logger_level):
+def router(host, port, mode, heartbeat, dealer_keys, client_keys, logger_level):
     """启动VoidRail Router服务"""
-    if generate_keys:
-        dealer_key = ApiKeyManager.generate_key(prefix="dealer")
-        client_key = ApiKeyManager.generate_key(prefix="client")
-        click.echo(f"生成的服务端密钥: {dealer_key}")
-        click.echo(f"生成的客户端密钥: {client_key}")
-        click.echo("\n可以使用以下命令启动认证Router:")
-        cmd = f"voidrail router --host {host} --port {port} --require-auth --dealer-keys {dealer_key} --client-keys {client_key}"
-        click.echo(f"  {cmd}")
-        return
 
     address = f"tcp://{host}:{port}"
-    router_mode = RouterMode.FIFO if mode == 'fifo' else RouterMode.LOAD_BALANCE
     
     async def start_router():
         router = ServiceRouter(
             address=address,
-            router_mode=router_mode,
-            heartbeat_timeout=heartbeat,
-            require_auth=require_auth,
+            heartbeat_interval=heartbeat,
             dealer_api_keys=list(dealer_keys) if dealer_keys else None,
             client_api_keys=list(client_keys) if client_keys else None,
             logger_level=logger_level
@@ -283,11 +268,10 @@ def client(host, port, list, router_info, queue_status, call, args, timeout, api
 @click.option('--module', '-m', required=True, help='包含ServiceDealer类的Python模块路径')
 @click.option('--class', 'class_names', multiple=True, help='ServiceDealer类名(可多次指定，不指定则自动推断)')
 @click.option('--instances', '-n', default=1, help='每个类启动的实例数量')
-@click.option('--max-concurrent', default=100, help='最大并发请求数')
-@click.option('--heartbeat', default=30, help='心跳间隔（秒）')
+@click.option('--heartbeat', default=1.0, help='心跳发送间隔（秒）')
 @click.option('--api-key', help='API认证密钥')
 @click.option('--logger-level', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']), default='INFO', help='日志级别')
-def dealer(host, port, module, class_names, instances, max_concurrent, heartbeat, api_key, logger_level):
+def dealer(host, port, module, class_names, instances, heartbeat, api_key, logger_level):
     """启动VoidRail Dealer服务实例(支持多进程)"""
     address = f"tcp://{host}:{port}"
     
@@ -352,7 +336,6 @@ def dealer(host, port, module, class_names, instances, max_concurrent, heartbeat
                     "dealer_class": dealer_class,
                     "instance_id": i+1,
                     "address": address,
-                    "max_concurrent": max_concurrent,
                     "heartbeat": heartbeat,
                     "api_key": api_key,
                     "logger_level": logger_level
@@ -445,7 +428,6 @@ def start_dealer_process(config: Dict[str, Any]):
             dealer_class=config['dealer_class'],
             class_name=config['class_name'],
             address=config['address'],
-            max_concurrent=config['max_concurrent'],
             heartbeat_interval=config['heartbeat'],
             api_key=config['api_key'],
             instance_id=config['instance_id'],
@@ -456,13 +438,12 @@ def start_dealer_process(config: Dict[str, Any]):
         logger.error(f"服务进程 {process_name} 发生错误: {e}")
         raise
 
-async def start_dealer_service(dealer_class, class_name, address, max_concurrent, 
+async def start_dealer_service(dealer_class, class_name, address, 
                               heartbeat_interval, api_key, instance_id, logger_level):
     """异步启动一个Dealer服务实例"""
     # 创建服务实例
     service = dealer_class(
         router_address=address,
-        max_concurrent=max_concurrent,
         heartbeat_interval=heartbeat_interval,
         api_key=api_key,
         logger_level=logger_level
@@ -473,7 +454,6 @@ async def start_dealer_service(dealer_class, class_name, address, max_concurrent
     logger = logging.getLogger("voidrail.dealer")
     logger.info(f"服务 {class_name} (实例 {instance_id}) 已启动并连接到 {address}")
     logger.info(f"服务ID: {service._service_id}")
-    logger.info(f"最大并发数: {max_concurrent}")
     
     # 设置信号处理 - 添加超时保护
     stop_event = asyncio.Event()

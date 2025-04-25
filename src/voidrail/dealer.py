@@ -129,9 +129,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         hwm: int = 1000,        # 网络层面的背压控制
         group: str = None,
         service_name: str = None,
-        heartbeat_interval: float = 0.5,   # 闲时心跳间隔
-        heartbeat_timeout: float = 5.0,    # 闲时心跳超时
-        service_id: str = None,
+        heartbeat_interval: float = 1.0,   # 用户唯一需配置的心跳间隔
         api_key: str = None,     # API密钥
         curve_server_key: bytes = None,  # 仅凭此参数判断是否启用加密
         logger_level: int = logging.INFO,
@@ -147,14 +145,26 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         # 记录是否需要自行创建context
         self._context = context or zmq.asyncio.Context()
         self._socket = None
-        self._idle_heartbeat_interval = heartbeat_interval
-        self._idle_heartbeat_timeout = heartbeat_timeout
-        self._busy_heartbeat_interval = 2.0    # 忙时心跳间隔，较长
-        self._busy_heartbeat_timeout = 10.0    # 忙时心跳超时，较长
-        
-        # 当前使用的参数，初始为闲时参数
+
+        # 1. 心跳发送间隔
+        I = heartbeat_interval
+        # 2. 空闲超时 = I + 3 秒
+        T_idle = I + 3
+        # 3. 忙时间隔与超时
+        I_busy = I * 4
+        T_busy = T_idle * 2
+        # 4. 接收超时
+        T_recv = I * 5
+
+        self._idle_heartbeat_interval = I
+        self._idle_heartbeat_timeout  = T_idle
+        self._busy_heartbeat_interval = I_busy
+        self._busy_heartbeat_timeout  = T_busy
+        self._receive_timeout         = T_recv
+
+        # 当前实际使用的 interval/timeout（会在忙闲切换中动态更新）
         self._heartbeat_interval = self._idle_heartbeat_interval
-        self._heartbeat_timeout = self._idle_heartbeat_timeout
+        self._heartbeat_timeout  = self._idle_heartbeat_timeout
         
         self._group = group or self._service_name
 
@@ -172,7 +182,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             }
 
         # 生成一个随机的 UUID 作为服务标识
-        self._service_id = service_id or f'{self._service_name}-{str(uuid.uuid4().hex[:8])}'
+        self._service_id = f'{self._service_name}-{str(uuid.uuid4().hex[:8])}'
 
         # 状态管理
         self._state = DealerState.INIT
@@ -323,22 +333,38 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         if self._state not in [DealerState.INIT, DealerState.STOPPED]:
             self._logger.warning(f"<{self._service_id}> Cannot start from {self._state} state")
             return False
-            
+
         self._state = DealerState.RUNNING
 
         try:
-            # 尝试启动和连接
+            # 1) 建立初始连接，并启动消息处理任务
             if not await self._do_reconnect():
-                self._logger.error(f"<{self._service_id}> 网络连接失败")
-                await self._cleanup_tasks() # 确保清理任务
+                self._logger.error(f"<{self._service_id}> 初始网络连接失败")
+                await self._cleanup_tasks()
                 self._state = DealerState.STOPPED
                 return False
-            # 继续启动过程...
+
+            # 2) 启动心跳循环任务
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(),
+                name=f"{self._service_id}-heartbeat"
+            )
+
+            # 3) 【关键】同时启动重连监控任务
+            self._reconnect_monitor_task = asyncio.create_task(
+                self._reconnect_monitor(),
+                name=f"{self._service_id}-reconnect_monitor"
+            )
+
+            self._logger.info(f"<{self._service_id}> 服务已启动，心跳和监控任务已运行")
+
         except Exception as e:
-            self._logger.error(f"启动失败: {e}")
-            await self._cleanup_tasks() # 确保清理任务
+            self._logger.error(f"<{self._service_id}> 启动服务时发生严重错误: {e}", exc_info=True)
+            await self._cleanup_tasks()
             self._state = DealerState.STOPPED
             return False
+
+        return True
 
     async def stop(self):
         """停止服务"""
@@ -485,21 +511,23 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                 try:
                     multipart = await asyncio.wait_for(
                         self._socket.recv_multipart(),
-                        timeout=min(1.0, self._heartbeat_interval * 2)  # 缩短超时时间
+                        timeout=self._receive_timeout
                     )
                 except asyncio.TimeoutError:
-                    # 超时时更新心跳状态
+                    # 超时逻辑现在基于固定的 _receive_timeout，不再与 interval 挂钩
+                    # 这里的超时可能意味着网络暂时中断或Router长时间无响应
+                    # 但不应立即触发重连，除非累积多次或达到 Dealer 的 heartbeat_timeout
                     error_count += 1
-                    self._update_heartbeat_status(False, "timeout")
-                    
-                    # 核心改进：连续超时过多次，主动触发重连
-                    if error_count >= 5 and self._state == DealerState.RUNNING:
-                        self._logger.warning(f"<{self._service_id}> 接收消息连续{error_count}次超时，主动断开重连")
-                        self._state = DealerState.RECONNECTING
-                        asyncio.create_task(self._do_reconnect())
-                        break
-                    
-                    continue
+                    self._logger.warning(f"<{self._service_id}> 在 {self._receive_timeout:.1f} 秒内未收到消息 (连续 {error_count} 次)")
+                    # self._update_heartbeat_status(False, "timeout") # 可能不再需要在这里更新心跳失败
+
+                    # 考虑: 如果连续超时次数过多，是否需要触发一次主动的心跳检查或更强的诊断？
+                    if error_count > 5: # 例如，连续5次接收超时
+                         self._logger.error(f"<{self._service_id}> 连续 {error_count} 次接收超时，连接可能存在严重问题。")
+                         # 可以考虑在这里触发 _do_reconnect，但要谨慎
+                         # 或者依赖 _heartbeat_loop / _reconnect_monitor 中基于 _heartbeat_timeout 的逻辑
+
+                    continue # 继续循环等待下一条消息
                 
                 # 收到消息，重置错误计数
                 error_count = 0
@@ -516,7 +544,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                 # 周期性打印诊断信息
                 current_time = time.time()
                 if current_time - last_diagnostics_time > 30:
-                    self._logger.info(f"<{self._service_id}> 消息统计：收到 {self._diagnostics['received_messages']} 条，"
+                    self._logger.debug(f"<{self._service_id}> 消息统计：收到 {self._diagnostics['received_messages']} 条，"
                                     f"发送 {self._diagnostics['sent_messages']} 条")
                     last_diagnostics_time = current_time
                 
@@ -573,7 +601,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
 
     async def _process_request(self, target_client_id: bytes, request: dict):
         """处理单个请求"""
-        self._logger.info(f"<{self._service_id}> DEALER Processing request: {request}")
+        self._logger.info(f"<{self._service_id}> DEALER Processing request: {str(request)[:300]}")
         
         try:
             # 检查方法是否注册过
