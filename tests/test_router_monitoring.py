@@ -5,7 +5,7 @@ import zmq.asyncio
 import time
 import logging
 
-from voidrail import ServiceRouter, RouterMode, ServiceDealer, ClientDealer, service_method
+from voidrail import ServiceRouter, ServiceDealer, ClientDealer, service_method
 
 logger = logging.getLogger(__name__)
 
@@ -33,37 +33,16 @@ async def router_fifo(zmq_context):
     router = ServiceRouter(
         address=ROUTER_ADDRESS,
         context=zmq_context,
-        router_mode=RouterMode.FIFO,
         heartbeat_timeout=0.5
     )
     await router.start()
     yield router
     await router.stop()
 
-@pytest_asyncio.fixture
-async def router_load_balance(zmq_context):
-    """创建并启动负载均衡模式路由器"""
-    router = ServiceRouter(
-        address=ROUTER_ADDRESS,
-        context=zmq_context,
-        router_mode=RouterMode.LOAD_BALANCE,
-        heartbeat_timeout=0.5
-    )
-    await router.start()
-    yield router
-    await router.stop()
 
 @pytest_asyncio.fixture
 async def client_dealer(router_fifo, zmq_context):
     """创建客户端 - 用于FIFO模式测试"""
-    client = ClientDealer(ROUTER_ADDRESS, context=zmq_context)
-    await client.connect()
-    yield client
-    await client.close()
-
-@pytest_asyncio.fixture
-async def lb_client_dealer(router_load_balance, zmq_context):
-    """创建客户端 - 用于负载均衡模式测试"""
     client = ClientDealer(ROUTER_ADDRESS, context=zmq_context)
     await client.connect()
     yield client
@@ -87,26 +66,6 @@ async def test_router_info_fifo(client_dealer):
     # 验证基本字段
     assert "mode" in router_info
     assert router_info["mode"] == "fifo"  # 确认是FIFO模式
-    assert "address" in router_info
-    assert "idle_heartbeat_timeout" in router_info
-    assert "busy_heartbeat_timeout" in router_info
-    assert "max_busy_without_heartbeat" in router_info
-    assert "active_services_count" in router_info
-    assert "total_services_count" in router_info
-    assert "requests_in_queue" in router_info
-    
-    # 打印路由器信息
-    logger.info(f"Router 信息: {router_info}")
-
-@pytest.mark.asyncio
-async def test_router_info_load_balance(lb_client_dealer):
-    """测试负载均衡模式下获取路由器信息功能"""
-    # 获取路由器信息
-    router_info = await lb_client_dealer.get_router_info()
-    
-    # 验证基本字段
-    assert "mode" in router_info
-    assert router_info["mode"] == "load_balance"  # 确认是负载均衡模式
     assert "address" in router_info
     assert "idle_heartbeat_timeout" in router_info
     assert "busy_heartbeat_timeout" in router_info

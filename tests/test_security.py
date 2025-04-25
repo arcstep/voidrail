@@ -512,3 +512,77 @@ async def test_secure_echo_with_auth(router_address, zmq_context, server_keys):
         await service.stop()
         await router.stop()
         logger.debug("测试清理完成")
+
+@pytest.mark.asyncio
+async def test_curve_and_apikey_together(router_address, zmq_context, server_keys):
+    """测试CURVE加密和API Key认证同时工作"""
+    logger.debug("开始CURVE加密与API Key认证协同工作测试")
+    
+    # 生成测试用API Key
+    API_KEY = f"test-key-{uuid.uuid4().hex[:8]}"
+    
+    # 1. 创建同时启用CURVE和API Key的路由器
+    router = ServiceRouter(
+        router_address, 
+        context=zmq_context,
+        curve_server_key_file=server_keys["secret_file"],  # 启用CURVE
+        client_api_keys=[API_KEY],                         # 启用API Key认证
+        logger_level=logging.DEBUG
+    )
+    
+    await router.start()
+    await asyncio.sleep(0.5)
+    
+    try:
+        # 2. 创建服务
+        service = SecureEchoService(
+            router_address,
+            context=zmq_context,
+            curve_server_key=server_keys["public_key"],  # 使用CURVE
+            logger_level=logging.DEBUG
+        )
+        
+        await service.start()
+        await asyncio.sleep(0.5)
+        
+        try:
+            # 3. 创建正确客户端(同时有CURVE和API Key)
+            correct_client = ClientDealer(
+                router_address,
+                context=zmq_context,
+                curve_server_key=server_keys["public_key"],  # 正确的CURVE
+                api_key=API_KEY,                             # 正确的API Key
+                timeout=2.0,
+                logger_level=logging.DEBUG
+            )
+            
+            # 4. 创建只有CURVE无API Key客户端
+            curve_only_client = ClientDealer(
+                router_address,
+                context=zmq_context,
+                curve_server_key=server_keys["public_key"],  # 正确的CURVE
+                # 没有API Key
+                timeout=2.0,
+                logger_level=logging.DEBUG
+            )
+            
+            # 5. 测试正确客户端能够通信
+            test_message = "CURVE和API Key双重安全"
+            response = await correct_client.invoke("SecureEchoService.echo", test_message)
+            assert response[0] == test_message, "正确配置的客户端应该能够成功通信"
+            
+            # 6. 测试只有CURVE的客户端被拒绝
+            with pytest.raises(Exception) as exc_info:
+                await curve_only_client.invoke("SecureEchoService.echo", "此消息不应发送")
+                
+            # 验证失败原因是认证相关
+            error_msg = str(exc_info.value).lower()
+            assert "auth" in error_msg or "认证" in error_msg or "not authenticated" in error_msg, \
+                   f"错误消息应包含认证失败信息，实际为：{error_msg}"
+                   
+            logger.info("CURVE和API Key协同工作测试通过")
+            
+        finally:
+            await service.stop()
+    finally:
+        await router.stop()
