@@ -6,7 +6,7 @@ import zmq.asyncio
 import logging
 import tempfile
 
-from voidrail import ServiceRouter, RouterMode
+from voidrail import ServiceRouter
 from voidrail import ServiceDealer, service_method
 from voidrail import ClientDealer
 from voidrail import ApiKeyManager
@@ -54,7 +54,6 @@ def auth_files():
             f.write(f"VOIDRAIL_API_KEY={client_key}\n")
             
         with open(router_env, "w") as f:
-            f.write(f"VOIDRAIL_REQUIRE_AUTH=true\n")
             f.write(f"VOIDRAIL_DEALER_API_KEYS={dealer_key}\n")
             f.write(f"VOIDRAIL_CLIENT_API_KEYS={client_key}\n")
         
@@ -71,7 +70,6 @@ def auth_files():
 async def auth_router(router_address, zmq_context, auth_files):
     """创建并启动带认证的路由器"""
     # 加载环境变量
-    os.environ["VOIDRAIL_REQUIRE_AUTH"] = "true"
     os.environ["VOIDRAIL_DEALER_API_KEYS"] = auth_files["dealer_key"]
     os.environ["VOIDRAIL_CLIENT_API_KEYS"] = auth_files["client_key"]
     
@@ -79,8 +77,6 @@ async def auth_router(router_address, zmq_context, auth_files):
         router_address,
         context=zmq_context,
         heartbeat_timeout=1.0,
-        router_mode=RouterMode.FIFO,
-        require_auth=True,
         dealer_api_keys=[auth_files["dealer_key"]],
         client_api_keys=[auth_files["client_key"]]
     )
@@ -88,8 +84,6 @@ async def auth_router(router_address, zmq_context, auth_files):
     yield router
     
     # 清理环境变量
-    if "VOIDRAIL_REQUIRE_AUTH" in os.environ:
-        del os.environ["VOIDRAIL_REQUIRE_AUTH"]
     if "VOIDRAIL_DEALER_API_KEYS" in os.environ:
         del os.environ["VOIDRAIL_DEALER_API_KEYS"]
     if "VOIDRAIL_CLIENT_API_KEYS" in os.environ:
@@ -103,9 +97,7 @@ async def no_auth_router(router_address, zmq_context):
     router = ServiceRouter(
         router_address,
         context=zmq_context,
-        heartbeat_timeout=1.0,
-        router_mode=RouterMode.FIFO,
-        require_auth=False
+        heartbeat_timeout=1.0
     )
     await router.start()
     yield router
@@ -404,7 +396,6 @@ async def test_multiple_services_with_auth(auth_router, router_address, zmq_cont
 async def test_router_auth_env_variable(router_address, zmq_context, auth_files):
     """测试从环境变量加载认证配置"""
     # 设置环境变量
-    os.environ["VOIDRAIL_REQUIRE_AUTH"] = "true"
     os.environ["VOIDRAIL_DEALER_API_KEYS"] = auth_files["dealer_key"]
     os.environ["VOIDRAIL_CLIENT_API_KEYS"] = auth_files["client_key"]
     
@@ -418,7 +409,6 @@ async def test_router_auth_env_variable(router_address, zmq_context, auth_files)
     
     try:
         # 验证路由器启用了认证
-        assert router._require_auth is True
         assert auth_files["dealer_key"] in router._dealer_api_keys
         assert auth_files["client_key"] in router._client_api_keys
         
@@ -453,8 +443,6 @@ async def test_router_auth_env_variable(router_address, zmq_context, auth_files)
         await router.stop()
         
         # 清理环境变量
-        if "VOIDRAIL_REQUIRE_AUTH" in os.environ:
-            del os.environ["VOIDRAIL_REQUIRE_AUTH"]
         if "VOIDRAIL_DEALER_API_KEYS" in os.environ:
             del os.environ["VOIDRAIL_DEALER_API_KEYS"]
         if "VOIDRAIL_CLIENT_API_KEYS" in os.environ:

@@ -16,10 +16,8 @@ class ClientDealer:
         context: Optional[zmq.asyncio.Context] = None,
         timeout: Optional[float] = None,
         api_key: Optional[str] = None,
+        curve_server_key: bytes = None,  # 仅凭此参数判断是否启用加密
         logger_level: int = logging.INFO,
-        use_curve: bool = False,               # 是否启用CURVE加密
-        curve_client_key_file: str = None,     # 客户端密钥文件
-        curve_server_key: bytes = None,        # 服务器公钥
     ):
         self._router_address = router_address
         self._timeout = timeout
@@ -40,17 +38,14 @@ class ClientDealer:
         # 认证状态
         self._authenticated = False
         
-        # CURVE加密设置
-        self._use_curve = use_curve or os.environ.get("VOIDRAIL_USE_CURVE", "").lower() in ('1', 'true', 'yes')
-        self._curve_client_key_file = curve_client_key_file
+        # 保存服务器公钥
         self._curve_server_key = curve_server_key
-        
-        # 如果环境变量中有服务器公钥字符串，则转换为字节
         if not self._curve_server_key:
             server_key_hex = os.environ.get("VOIDRAIL_CURVE_SERVER_KEY")
             if server_key_hex:
                 try:
                     self._curve_server_key = bytes.fromhex(server_key_hex)
+                    self._logger.info("从环境变量加载了CURVE服务器公钥")
                 except ValueError:
                     self._logger.error("无效的服务器公钥格式，应为十六进制字符串")
 
@@ -61,21 +56,20 @@ class ClientDealer:
             self._socket = self._context.socket(zmq.DEALER)
             self._socket.identity = self._client_id.encode()
             
-            # 设置CURVE加密
-            if self._use_curve and self._curve_server_key:
-                # 生成或加载客户端密钥对
-                if self._curve_client_key_file and os.path.exists(self._curve_client_key_file):
-                    client_public, client_secret = zmq.auth.load_certificate(self._curve_client_key_file)
-                else:
-                    # 如果没有指定密钥文件，则生成临时密钥对
+            # 自动检测是否需要CURVE加密
+            if self._curve_server_key:
+                try:
+                    # 生成临时客户端密钥对
                     client_public, client_secret = zmq.curve_keypair()
-                
-                # 应用CURVE加密
-                self._socket.curve_secretkey = client_secret
-                self._socket.curve_publickey = client_public
-                self._socket.curve_serverkey = self._curve_server_key
-                
-                self._logger.info(f"已启用CURVE加密连接，客户端公钥: {client_public.hex()[:8]}...")
+                    
+                    # 应用CURVE设置
+                    self._socket.curve_secretkey = client_secret
+                    self._socket.curve_publickey = client_public
+                    self._socket.curve_serverkey = self._curve_server_key
+                    
+                    self._logger.info(f"已启用CURVE加密连接，客户端公钥: {client_public.hex()[:8]}...")
+                except Exception as e:
+                    self._logger.error(f"CURVE加密配置失败: {e}")
             
             # 连接到路由器
             self._socket.connect(self._router_address)

@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 import logging
 
-from voidrail import ServiceRouter, RouterMode, ServiceDealer, ClientDealer, service_method
+from voidrail import ServiceRouter, ServiceDealer, ClientDealer, service_method
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +43,7 @@ async def router_fifo(router_address, zmq_context, test_config):
     router = ServiceRouter(
         router_address, 
         context=zmq_context,
-        heartbeat_timeout=test_config['heartbeat_timeout'],
-        router_mode=RouterMode.FIFO
+        heartbeat_timeout=test_config['heartbeat_timeout']
     )
     await router.start()
     await asyncio.sleep(0.1)

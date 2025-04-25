@@ -11,6 +11,7 @@ import asyncio
 import logging
 import json
 import uuid
+import zmq.auth
 
 class ServiceState(str, Enum):
     """服务状态枚举"""
@@ -72,13 +73,10 @@ class ServiceRouter:
         heartbeat_timeout: float = 30.0,       # 空闲状态超时时间（秒）
         idle_heartbeat_check: float = 10.0,    # 空闲状态心跳检查间隔（秒）
         hwm: int = 1000,
-        require_auth: bool = None,             # 是否要求认证
         dealer_api_keys: List[str] = None,     # DEALER 端 API 密钥列表
         client_api_keys: List[str] = None,     # CLIENT 端 API 密钥列表
+        curve_server_key_file: str = None,  # 保留此参数
         logger_level: int = logging.INFO,
-        use_curve: bool = False,                # 是否启用CURVE加密
-        curve_server_key_file: str = None,      # 服务器密钥文件路径
-        curve_client_directory: str = None,     # 客户端公钥目录
     ):
         self._context = context or zmq.asyncio.Context()
         self._address = address
@@ -116,21 +114,19 @@ class ServiceRouter:
         self._method_queues = defaultdict(deque)    # 为每个方法创建请求队列
         self._dealer_processing = defaultdict(int)  # 记录每个DEALER端当前处理的请求数
 
-        # API密钥认证配置
-        env_require_auth = os.environ.get("VOIDRAIL_REQUIRE_AUTH", "").lower()
-        self._require_auth = require_auth if require_auth is not None else (env_require_auth in ('1', 'true', 'yes'))
-        
-        # 加载DEALER端密钥
+        # API密钥认证配置 - 自动判断是否需要认证
         self._dealer_api_keys = dealer_api_keys or []
         env_dealer_keys = os.environ.get("VOIDRAIL_DEALER_API_KEYS", "")
         if env_dealer_keys:
             self._dealer_api_keys.extend([k.strip() for k in env_dealer_keys.split(",") if k.strip()])
         
-        # 加载CLIENT端密钥
         self._client_api_keys = client_api_keys or []
         env_client_keys = os.environ.get("VOIDRAIL_CLIENT_API_KEYS", "")
         if env_client_keys:
             self._client_api_keys.extend([k.strip() for k in env_client_keys.split(",") if k.strip()])
+        
+        # 根据是否有API密钥自动决定是否需要认证
+        self._require_auth = bool(self._dealer_api_keys or self._client_api_keys)
         
         # 记录已认证的客户端ID
         self._authenticated_clients = set()
@@ -160,56 +156,98 @@ class ServiceRouter:
         # 新增：连续失败计数阈值
         self._CONSECUTIVE_FAILURES_THRESHOLD = 2
 
-        # CURVE加密设置
-        self._use_curve = use_curve
-        self._auth = None
-        
-        if self._use_curve:
-            # 初始化认证器
-            self._auth = zmq.auth.ThreadAuthenticator(self._context)
-            self._auth.start()
-            
-            # 加载服务器密钥
-            server_public, server_secret = zmq.auth.load_certificate(curve_server_key_file)
-            
-            # 设置CURVE认证 - 指定客户端公钥目录
-            if curve_client_directory:
-                # 严格模式 - 只允许已授权的客户端
-                self._auth.configure_curve(domain='*', location=curve_client_directory)
-            else:
-                # 开发模式 - 允许任何CURVE客户端
-                self._auth.configure_curve(domain='*', location=zmq.auth.CURVE_ALLOW_ANY)
-            
-            # 设置socket
-            self._socket.curve_secretkey = server_secret
-            self._socket.curve_publickey = server_public
-            self._socket.curve_server = True
-            
-            self._logger.info(f"CURVE加密已启用，服务器公钥: {server_public.hex()[:8]}...")
+        # 新增: 存储加载的密钥
+        self._curve_server_public = None
+        self._curve_server_secret = None
+
+        # 自动证书管理
+        self._curve_enabled = bool(curve_server_key_file)
+        if self._curve_enabled:
+            if not os.path.exists(curve_server_key_file):
+                raise ValueError(f"CURVE密钥文件不存在: {curve_server_key_file}")
+
+            # 加载服务器密钥并存储
+            try:
+                self._curve_server_public, self._curve_server_secret = zmq.auth.load_certificate(curve_server_key_file)
+                self._logger.info(f"CURVE服务器密钥已加载自: {curve_server_key_file}")
+            except Exception as e:
+                self._logger.error(f"加载CURVE密钥失败: {e}", exc_info=True)
+                raise
+
+            # 在初始 socket 上应用 CURVE 配置
+            self._apply_curve_config(self._socket)
+
+            # 添加这些详细的调试日志
+            try:
+                # 测试验证器是否正常工作的简单方法
+                test_client_public, test_client_secret = zmq.curve_keypair()
+                self._logger.debug(f"CURVE测试: 生成临时客户端密钥对成功")
+                self._logger.debug(f"CURVE socket 配置完成: server_public={self._curve_server_public.hex()[:16]}")
+                
+                # 保存重要的状态信息供诊断
+                self.curve_enabled = True
+                self.curve_server_public = self._curve_server_public
+            except Exception as e:
+                self._logger.error(f"CURVE配置诊断失败: {e}")
+
+    # 新增: 辅助方法来应用CURVE配置
+    def _apply_curve_config(self, socket_instance):
+        """将CURVE配置应用到给定的套接字实例"""
+        if self._curve_enabled and self._curve_server_public and self._curve_server_secret:
+            try:
+                socket_instance.curve_secretkey = self._curve_server_secret
+                socket_instance.curve_publickey = self._curve_server_public
+                socket_instance.curve_server = True
+                self._logger.debug(f"成功将 CURVE 配置应用到套接字 {socket_instance}")
+            except Exception as e:
+                self._logger.error(f"将 CURVE 配置应用到套接字失败: {e}", exc_info=True)
+        elif self._curve_enabled:
+            self._logger.error("尝试应用 CURVE 配置，但密钥未成功加载")
 
     async def _force_reconnect(self):
         """强制完全重置连接"""
         self._logger.info("Initiating forced reconnection...")
         
         # 重新初始化socket
+        # 确保在创建新 socket 之前旧 socket 已关闭 (虽然 _reconnect 也会做，但这里更保险)
+        if self._socket and not self._socket.closed:
+            self._socket.close(linger=0)
+
         self._socket = self._context.socket(zmq.ROUTER)
-        self._socket.setsockopt(zmq.LINGER, 0)  # 设置无等待关闭
-        self._socket.setsockopt(zmq.IMMEDIATE, 1)  # 禁用缓冲
-        self._socket.bind(self._address)
-        
+        self._logger.debug(f"新套接字实例已创建: {self._socket}")
+        # 设置选项应该在应用 CURVE 和绑定之前
+        self._socket.setsockopt(zmq.LINGER, 0)
+        self._socket.setsockopt(zmq.IMMEDIATE, 1) # 注意: IMMEDIATE 可能影响性能/可靠性，根据需要调整
+
+        # !!! 关键修改: 在新套接字上重新应用 CURVE 配置 !!!
+        self._apply_curve_config(self._socket) # <--- 调用辅助方法
+
+        # 绑定新套接字
+        try:
+            self._socket.bind(self._address)
+            self._logger.info(f"新套接字已成功绑定到 {self._address}")
+        except zmq.ZMQError as e:
+            self._logger.error(f"新套接字绑定失败: {e}", exc_info=True)
+            # 绑定失败是严重问题，可能需要停止或重试
+            raise # 重新抛出异常
+
         # 重置心跳状态
-        self._last_heartbeat_logs = {}  # 记录每个服务上次的心跳日志状态
-        self._last_health_check = time()     # 最后检查时间戳
+        self._last_heartbeat_logs = {}
+        self._last_health_check = time()
 
     async def _reconnect(self):
         """尝试重新连接到路由器"""
         self._logger.info(f"开始执行重连...")
         
         try:
-            # 关闭现有连接
+            # 关闭现有连接 (如果存在且未关闭)
             if self._socket and not self._socket.closed:
-                self._socket.close()
-            
+                self._socket.close(linger=0) # linger=0 避免阻塞
+                self._logger.debug("旧套接字已关闭")
+            else:
+                self._logger.debug("没有需要关闭的旧套接字")
+
+            # 调用强制重连（现在会正确配置新 socket）
             await self._force_reconnect()
 
             # 重连状态

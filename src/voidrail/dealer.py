@@ -133,13 +133,10 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         heartbeat_timeout: float = 5.0,    # 闲时心跳超时
         service_id: str = None,
         api_key: str = None,     # API密钥
-        port: int = None,        # 服务端口
+        curve_server_key: bytes = None,  # 仅凭此参数判断是否启用加密
         logger_level: int = logging.INFO,
         disable_reconnect: bool = False,
         max_consecutive_reconnects=5,
-        use_curve: bool = False,               # 是否启用CURVE加密
-        curve_client_key_file: str = None,     # 客户端密钥文件
-        curve_server_key: bytes = None,        # 服务器公钥
     ):
         self._router_address = router_address
         self._hwm = hwm
@@ -208,16 +205,18 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         if not self._api_key:
             self._logger.warning(f"<{self._service_id}> 未设置API密钥，可能无法连接到开启了验证的Router")
 
-        # 保存端口信息（如果提供）
-        self._port = port
-
         self._disable_reconnect = disable_reconnect
 
-        # CURVE加密设置
-        self._use_curve = use_curve
+        # 保存服务器公钥
         self._curve_server_key = curve_server_key
-        
-        # 创建socket时应用CURVE设置
+        if not self._curve_server_key:
+            server_key_hex = os.environ.get("VOIDRAIL_CURVE_SERVER_KEY")
+            if server_key_hex:
+                try:
+                    self._curve_server_key = bytes.fromhex(server_key_hex)
+                    self._logger.info("从环境变量加载了CURVE服务器公钥")
+                except ValueError:
+                    self._logger.error("无效的服务器公钥格式，应为十六进制字符串")
     
     async def _force_reconnect(self):
         """强制完全重置连接"""
@@ -275,27 +274,23 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                 self._socket.identity = self._service_id.encode()
                 self._socket.set_hwm(self._hwm)
                 self._socket.setsockopt(zmq.LINGER, 0)
-                self._socket.connect(self._router_address)
                 
-                # 4. 设置CURVE加密 (如果需要)
-                if self._use_curve and self._curve_server_key:
-                    # 需要确保每次重连时使用相同客户端密钥(可选)
-                    if hasattr(self, '_curve_client_keypair'):
-                        client_public, client_secret = self._curve_client_keypair
-                    else:
-                        if hasattr(self, '_curve_client_key_file') and os.path.exists(self._curve_client_key_file):
-                            client_public, client_secret = zmq.auth.load_certificate(self._curve_client_key_file)
-                        else:
-                            client_public, client_secret = zmq.curve_keypair()
-                            # 存储密钥对以便重用
-                            self._curve_client_keypair = (client_public, client_secret)
-                    
-                    # 应用CURVE设置
-                    self._socket.curve_secretkey = client_secret
-                    self._socket.curve_publickey = client_public
-                    self._socket.curve_serverkey = self._curve_server_key
-                    
-                    self._logger.info(f"重连时启用CURVE加密")
+                # 自动检测是否需要CURVE加密
+                if self._curve_server_key:
+                    try:
+                        # 生成临时客户端密钥对
+                        client_public, client_secret = zmq.curve_keypair()
+                        
+                        # 应用CURVE设置
+                        self._socket.curve_secretkey = client_secret
+                        self._socket.curve_publickey = client_public
+                        self._socket.curve_serverkey = self._curve_server_key
+                        
+                        self._logger.info(f"重连时启用CURVE加密，客户端公钥: {client_public.hex()[:8]}...")
+                    except Exception as e:
+                        self._logger.error(f"CURVE加密配置失败: {e}")
+                
+                self._socket.connect(self._router_address)
                 
                 # 5. 更新连接状态
                 self._last_successful_heartbeat = time.time()
@@ -411,13 +406,8 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             process_id = os.getpid()
             
             # 构建地址信息 - 使用更有意义的格式
-            if hasattr(self, '_port') and self._port:
-                # 如果有明确指定的端口，使用它
-                remote_addr = f"{ip_address}:{self._port}"
-            else:
-                # 否则使用进程ID和服务ID的组合
-                service_uuid = self._service_id.split('-')[-1] if '-' in self._service_id else self._service_id[-8:]
-                remote_addr = f"{ip_address} [PID:{process_id}, ID:{service_uuid}]"
+            service_uuid = self._service_id.split('-')[-1] if '-' in self._service_id else self._service_id[-8:]
+            remote_addr = f"{ip_address} [PID:{process_id}, ID:{service_uuid}]"
             
             # 创建可序列化的方法信息字典
             serializable_methods = {}
