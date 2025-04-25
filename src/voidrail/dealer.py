@@ -312,6 +312,12 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                 self._state = DealerState.INIT  # 重置状态
                 return False
 
+    async def __aenter__(self):
+        await self.start()
+        return self
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.stop()
+
     async def start(self):
         """启动服务"""
         if self._state not in [DealerState.INIT, DealerState.STOPPED]:
@@ -320,21 +326,19 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             
         self._state = DealerState.RUNNING
 
-        # 重建连接
-        if not await self._do_reconnect():
-            self._logger.error(f"<{self._service_id}> 网络连接失败")
+        try:
+            # 尝试启动和连接
+            if not await self._do_reconnect():
+                self._logger.error(f"<{self._service_id}> 网络连接失败")
+                await self._cleanup_tasks() # 确保清理任务
+                self._state = DealerState.STOPPED
+                return False
+            # 继续启动过程...
+        except Exception as e:
+            self._logger.error(f"启动失败: {e}")
+            await self._cleanup_tasks() # 确保清理任务
+            self._state = DealerState.STOPPED
             return False
-
-        # 启动核心任务
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name=f"{self._service_id}-heartbeat")
-        self._process_messages_task = asyncio.create_task(self._process_messages(), name=f"{self._service_id}-process_messages")
-        self._reconnect_monitor_task = asyncio.create_task(self._reconnect_monitor(), name=f"{self._service_id}-reconnect_monitor")
-
-        await self._register_to_router()
-
-        self._logger.info(f"<{self._service_id}> Service {self._service_id} started with {len(self._handlers)} methods")
-        self._last_successful_heartbeat = time.time()
-        return True
 
     async def stop(self):
         """停止服务"""
@@ -389,6 +393,15 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             self._socket = None
         
         self._state = DealerState.STOPPED
+
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+                # 如果依旧没停，再给一次 very short await
+                try:
+                    await asyncio.wait_for(t, timeout=0.1)
+                except:  # pragma: no cover
+                    pass
 
     async def _register_to_router(self):
         """向Router注册服务信息"""
@@ -792,3 +805,23 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             self._logger.error(f"<{self._service_id}> 诊断结果：连续多次重连失败，可能是ROUTER不可用或网络问题")
         
         self._logger.info(f"<{self._service_id}> 连接诊断信息: {diagnostics_info}")
+
+    async def _cleanup_tasks(self):
+        """集中清理所有tasks的逻辑"""
+        tasks = list(self._pending_tasks)
+        
+        for task_attr in ['_process_messages_task', '_heartbeat_task', '_reconnect_monitor_task']:
+            task = getattr(self, task_attr, None)
+            if task and not task.done():
+                task.cancel()
+                tasks.append(task)
+                setattr(self, task_attr, None)
+        
+        for task in tasks:
+            if not task.done():
+                try:
+                    await asyncio.wait_for(task, timeout=0.5)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+        
+        self._pending_tasks.clear()

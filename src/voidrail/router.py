@@ -114,27 +114,30 @@ class ServiceRouter:
         self._method_queues = defaultdict(deque)    # 为每个方法创建请求队列
         self._dealer_processing = defaultdict(int)  # 记录每个DEALER端当前处理的请求数
 
-        # API密钥认证配置 - 自动判断是否需要认证
+        # API密钥认证配置 - 分开处理 Dealer 和 Client
         self._dealer_api_keys = dealer_api_keys or []
         env_dealer_keys = os.environ.get("VOIDRAIL_DEALER_API_KEYS", "")
         if env_dealer_keys:
             self._dealer_api_keys.extend([k.strip() for k in env_dealer_keys.split(",") if k.strip()])
-        
+
         self._client_api_keys = client_api_keys or []
         env_client_keys = os.environ.get("VOIDRAIL_CLIENT_API_KEYS", "")
         if env_client_keys:
             self._client_api_keys.extend([k.strip() for k in env_client_keys.split(",") if k.strip()])
-        
-        # 根据是否有API密钥自动决定是否需要认证
-        self._require_auth = bool(self._dealer_api_keys or self._client_api_keys)
-        
+
         # 记录已认证的客户端ID
         self._authenticated_clients = set()
-        
-        if self._require_auth:
-            self._logger.info(f"API密钥认证已启用 (dealer_keys={len(self._dealer_api_keys)}, client_keys={len(self._client_api_keys)})")
+
+        # 更新日志，分别说明两种认证状态
+        if self._dealer_api_keys:
+             self._logger.info(f"DEALER API密钥认证已启用 (keys={len(self._dealer_api_keys)})")
         else:
-            self._logger.info("API密钥认证未启用")
+             self._logger.info("DEALER API密钥认证未启用")
+
+        if self._client_api_keys:
+             self._logger.info(f"CLIENT API密钥认证已启用 (keys={len(self._client_api_keys)})")
+        else:
+             self._logger.info("CLIENT API密钥认证未启用")
 
         # 统计信息
         self._total_request_count = 0
@@ -321,42 +324,33 @@ class ServiceRouter:
             self._logger.info(f"Router stopped")
 
     def _verify_dealer_api_key(self, api_key: str) -> bool:
-        """验证DEALER端API密钥是否有效"""
-        if not self._require_auth:
-            return True
+        """验证DEALER端API密钥是否有效 (仅当被调用时检查列表)"""
         return api_key in self._dealer_api_keys
 
     def _verify_client_api_key(self, api_key: str) -> bool:
-        """验证CLIENT端API密钥是否有效"""
-        if not self._require_auth:
-            return True
+        """验证CLIENT端API密钥是否有效 (仅当被调用时检查列表)"""
         return api_key in self._client_api_keys
 
     def _check_client_auth(self, client_id: str) -> bool:
-        """检查客户端是否已认证"""
-        if not self._require_auth:
-            return True
+        """检查客户端是否已认证 (仅当被调用时检查集合)"""
         return client_id in self._authenticated_clients
 
     def register_service(self, service_id: str, service_info: Dict[str, Any]):
         """注册服务"""
-        # 验证API密钥
         api_key = service_info.get('api_key', '')
-        if self._require_auth and not self._verify_dealer_api_key(api_key):
-            self._logger.warning(f"服务认证失败: {service_id}, 提供的API密钥无效")
+        # 检查 self._dealer_api_keys 是否非空
+        if self._dealer_api_keys and not self._verify_dealer_api_key(api_key):
+            self._logger.warning(f"服务注册认证失败: {service_id}, 提供的 DEALER API 密钥无效")
             return False
-            
-        max_concurrent = service_info.get('max_concurrent', 100)  # 默认最大并发数
-        # 保留所有方法信息，不仅仅是metadata
+
+        max_concurrent = service_info.get('max_concurrent', 100)
         methods = {
-            f"{service_info.get('group', 'default')}.{name}": info 
+            f"{service_info.get('group', 'default')}.{name}": info
             for name, info in service_info.get('methods', {}).items()
         }
-        
-        # 检查是否是服务重连
+
         is_reconnect = service_id in self._services
-        
-        # 规范化服务地址格式
+
         if 'remote_addr' in service_info:
             remote_addr = service_info.get('remote_addr')
             host_info = service_info.get('host_info', {})
@@ -381,13 +375,13 @@ class ServiceRouter:
             request_count=service_info.get('request_count', 0),
             reply_count=service_info.get('reply_count', 0)
         )
-        
+
         if is_reconnect:
             self._logger.info(f"Reconnected service: {service_id} with max_concurrent={max_concurrent}")
         else:
             self._logger.info(f"Registered new service: {service_id} with max_concurrent={max_concurrent}")
-        
-        return True
+
+        return True # 添加明确的返回 True
 
     def unregister_service(self, service_id: str):
         """注销服务"""
@@ -420,7 +414,7 @@ class ServiceRouter:
         self._logger.error(f"Error sending to {from_id}: {error}")
 
     async def _route_messages(self):
-        """消息路由主循环 - 修改为仅支持FIFO模式"""
+        """消息路由主循环"""
         self._logger.info(f"路由消息处理器启动于 {self._address}")
         while self._state == RouterState.RUNNING:
             try:
@@ -436,6 +430,11 @@ class ServiceRouter:
                 
                 # 处理客户端认证请求
                 if message_type == "auth":
+                    # 仅当配置了 client_api_keys 时才处理 auth 消息
+                    if not self._client_api_keys:
+                        self._logger.warning(f"收到来自 {from_id} 的 auth 请求，但未配置客户端 API Keys，忽略。")
+                        await self._send_error(from_id_bytes, "No need to authenticate")
+
                     # API_KEY认证请求数据内容已通过CURVE加密
                     if len(multipart) < 3:
                         await self._send_error(from_id_bytes, "Invalid auth format")
@@ -505,17 +504,13 @@ class ServiceRouter:
                         registration_success = self.register_service(from_id, service_info)
                         
                         if registration_success:
-                            # 只在首次注册时设置ACTIVE状态
-                            if from_id not in self._services:
-                                self._services[from_id].state = ServiceState.ACTIVE
-                                
                             await self._socket.send_multipart([
                                 from_id_bytes,
                                 b"register_ack",
                                 b""
                             ])
                         else:
-                            await self._send_error(from_id_bytes, "Registration failed: invalid API key")
+                            await self._send_error(from_id_bytes, "Registration failed: invalid API key or other issue")
                     
                 elif message_type == "heartbeat":
                     # 处理心跳消息
@@ -554,8 +549,8 @@ class ServiceRouter:
                         self._logger.warning(f"Received heartbeat from unregistered service: {from_id}")
                 
                 elif message_type == "clusters":
-                    # 客户端认证检查
-                    if self._require_auth and not self._check_client_auth(from_id):
+                    # 客户端认证检查 - 检查 self._client_api_keys 是否非空
+                    if self._client_api_keys and not self._check_client_auth(from_id):
                         await self._send_error(from_id_bytes, "Not authenticated")
                         continue
                         
@@ -574,8 +569,8 @@ class ServiceRouter:
                     ])
                     
                 elif message_type == "methods":
-                    # 客户端认证检查
-                    if self._require_auth and not self._check_client_auth(from_id):
+                    # 客户端认证检查 - 检查 self._client_api_keys 是否非空
+                    if self._client_api_keys and not self._check_client_auth(from_id):
                         await self._send_error(from_id_bytes, "Not authenticated")
                         continue
                         
@@ -600,8 +595,8 @@ class ServiceRouter:
                     ])
                     
                 elif message_type == "call_from_client":
-                    # 客户端认证检查
-                    if self._require_auth and not self._check_client_auth(from_id):
+                    # 客户端认证检查 - 检查 self._client_api_keys 是否非空
+                    if self._client_api_keys and not self._check_client_auth(from_id):
                         await self._send_error(from_id_bytes, "未认证")
                         continue
                         
@@ -667,8 +662,8 @@ class ServiceRouter:
                             await self._process_fifo_queue(method_name)
 
                 elif message_type == "queue_status":
-                    # 客户端认证检查
-                    if self._require_auth and not self._check_client_auth(from_id):
+                    # 客户端认证检查 - 检查 self._client_api_keys 是否非空
+                    if self._client_api_keys and not self._check_client_auth(from_id):
                         await self._send_error(from_id_bytes, "Not authenticated")
                         continue
                         
@@ -706,8 +701,8 @@ class ServiceRouter:
                     ])
 
                 elif message_type == "router_info":
-                    # 客户端认证检查
-                    if self._require_auth and not self._check_client_auth(from_id):
+                    # 客户端认证检查 - 检查 self._client_api_keys 是否非空
+                    if self._client_api_keys and not self._check_client_auth(from_id):
                         await self._send_error(from_id_bytes, "Not authenticated")
                         continue
                         
@@ -759,7 +754,8 @@ class ServiceRouter:
                         "requests_in_queue": sum(len(queue) for queue in self._method_queues.values()),
                         "service_by_group": service_by_group,
                         "service_sources": services_by_source,
-                        "auth_required": self._require_auth
+                        "client_api_keys_require": bool(self._client_api_keys),
+                        "dealer_api_keys_require": bool(self._dealer_api_keys),
                     }
                     
                     response = {

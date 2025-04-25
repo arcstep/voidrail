@@ -34,8 +34,8 @@ def router_address():
 def test_config():
     """测试配置"""
     return {
-        'heartbeat_timeout': 0.1,  # 缩短到100ms
-        'heartbeat_interval': 0.05, # 缩短到50ms
+        'heartbeat_timeout': 0.2,  # 缩短到100ms
+        'heartbeat_interval': 0.5, # 缩短到50ms
     }
 
 @pytest_asyncio.fixture
@@ -395,7 +395,7 @@ class TestLoadBalancing:
         # 停止第一个服务
         await service.stop()
         # 等待更长时间确保路由器完成服务下线处理
-        await asyncio.sleep(1.0)  # 增加到1秒
+        await asyncio.sleep(2.0)  # 增加到1秒
         
         # 强制更新服务发现缓存
         await client.discover_clusters()

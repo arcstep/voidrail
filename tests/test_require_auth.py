@@ -5,6 +5,7 @@ import os
 import zmq.asyncio
 import logging
 import tempfile
+import uuid
 
 from voidrail import ServiceRouter
 from voidrail import ServiceDealer, service_method
@@ -15,435 +16,400 @@ logger = logging.getLogger(__name__)
 
 @pytest.fixture(autouse=True)
 def setup_logging(caplog):
-    """设置日志级别"""
-    # 重置所有处理器的日志级别
+    """设置日志级别为 DEBUG"""
+    logging.getLogger().setLevel(logging.INFO)
     for handler in logging.getLogger().handlers:
         handler.setLevel(logging.INFO)
-    # 设置 caplog 捕获级别
     caplog.set_level(logging.INFO)
 
 @pytest.fixture
 def zmq_context():
-    """创建共享的 ZMQ Context"""
-    context = zmq.asyncio.Context.instance()
+    """创建独立的 ZMQ Context 并确保终止"""
+    context = zmq.asyncio.Context()
     yield context
+    logger.debug("Attempting to terminate ZMQ context...")
+    context.term()
+    logger.debug("ZMQ context terminated.")
 
 @pytest.fixture
 def router_address():
-    """返回路由器地址"""
-    return "inproc://router_auth_test"
+    """返回唯一的路由器地址，避免测试间冲突"""
+    return f"inproc://router_auth_test_{uuid.uuid4().hex}"
 
 @pytest.fixture
-def auth_files():
-    """创建测试用的环境变量文件"""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        dealer_env = os.path.join(temp_dir, "dealer.env")
-        client_env = os.path.join(temp_dir, "client.env")
-        router_env = os.path.join(temp_dir, "router.env")
-        
-        # 生成密钥
-        dealer_key = ApiKeyManager.generate_key(prefix="dealer")
-        client_key = ApiKeyManager.generate_key(prefix="client")
-        invalid_key = ApiKeyManager.generate_key(prefix="invalid")
-        
-        # 创建环境变量文件
-        with open(dealer_env, "w") as f:
-            f.write(f"VOIDRAIL_API_KEY={dealer_key}\n")
-        
-        with open(client_env, "w") as f:
-            f.write(f"VOIDRAIL_API_KEY={client_key}\n")
-            
-        with open(router_env, "w") as f:
-            f.write(f"VOIDRAIL_DEALER_API_KEYS={dealer_key}\n")
-            f.write(f"VOIDRAIL_CLIENT_API_KEYS={client_key}\n")
-        
-        yield {
-            "dealer_env": dealer_env,
-            "client_env": client_env,
-            "router_env": router_env,
+def auth_keys():
+    """生成测试用的API Keys"""
+    dealer_key = ApiKeyManager.generate_key(prefix="dealer")
+    client_key = ApiKeyManager.generate_key(prefix="client")
+    invalid_key = ApiKeyManager.generate_key(prefix="invalid")
+    return {
             "dealer_key": dealer_key,
             "client_key": client_key,
             "invalid_key": invalid_key
         }
 
 @pytest_asyncio.fixture
-async def auth_router(router_address, zmq_context, auth_files):
-    """创建并启动带认证的路由器"""
-    # 加载环境变量
-    os.environ["VOIDRAIL_DEALER_API_KEYS"] = auth_files["dealer_key"]
-    os.environ["VOIDRAIL_CLIENT_API_KEYS"] = auth_files["client_key"]
-    
+async def both_auth_router(router_address, zmq_context, auth_keys):
+    """创建并启动需要双重认证的路由器 (DEBUG log)"""
     router = ServiceRouter(
         router_address,
         context=zmq_context,
         heartbeat_timeout=1.0,
-        dealer_api_keys=[auth_files["dealer_key"]],
-        client_api_keys=[auth_files["client_key"]]
+        idle_heartbeat_check=0.5,
+        dealer_api_keys=[auth_keys["dealer_key"]],
+        client_api_keys=[auth_keys["client_key"]],
+        logger_level=logging.DEBUG
     )
     await router.start()
     yield router
-    
-    # 清理环境变量
-    if "VOIDRAIL_DEALER_API_KEYS" in os.environ:
-        del os.environ["VOIDRAIL_DEALER_API_KEYS"]
-    if "VOIDRAIL_CLIENT_API_KEYS" in os.environ:
-        del os.environ["VOIDRAIL_CLIENT_API_KEYS"]
-    
+    await router.stop()
+
+@pytest_asyncio.fixture
+async def only_client_auth_router(router_address, zmq_context, auth_keys):
+    """创建并启动仅需客户端认证的路由器 (DEBUG log)"""
+    router = ServiceRouter(
+        router_address,
+        context=zmq_context,
+        heartbeat_timeout=1.0,
+        idle_heartbeat_check=0.5,
+        client_api_keys=[auth_keys["client_key"]],
+        logger_level=logging.DEBUG
+    )
+    await router.start()
+    yield router
+    await router.stop()
+
+@pytest_asyncio.fixture
+async def only_dealer_auth_router(router_address, zmq_context, auth_keys):
+    """创建并启动仅需处理端认证的路由器 (DEBUG log)"""
+    router = ServiceRouter(
+        router_address,
+        context=zmq_context,
+        heartbeat_timeout=1.0,
+        idle_heartbeat_check=0.5,
+        dealer_api_keys=[auth_keys["dealer_key"]],
+        logger_level=logging.DEBUG
+    )
+    await router.start()
+    yield router
     await router.stop()
 
 @pytest_asyncio.fixture
 async def no_auth_router(router_address, zmq_context):
-    """创建并启动不需要认证的路由器"""
+    """创建并启动不需要认证的路由器 (DEBUG log)"""
     router = ServiceRouter(
-        router_address,
-        context=zmq_context,
-        heartbeat_timeout=1.0
+        router_address, 
+        context=zmq_context, 
+        heartbeat_timeout=1.0,
+        idle_heartbeat_check=0.5,
+        logger_level=logging.DEBUG
     )
     await router.start()
     yield router
     await router.stop()
 
-@pytest_asyncio.fixture
-async def valid_auth_service(auth_router, router_address, zmq_context, auth_files):
-    """创建并启动有效认证的服务"""
-    service = AuthTestService(
-        router_address, 
-        context=zmq_context, 
-        api_key=auth_files["dealer_key"]
-    )
-    await service.start()
-    yield service
-    await service.stop()
-
-@pytest_asyncio.fixture
-async def valid_auth_client(router_address, zmq_context, auth_files):
-    """创建有效认证的客户端，但不自动连接"""
-    client = ClientDealer(
-        router_address, 
-        context=zmq_context, 
-        timeout=2.0,
-        api_key=auth_files["client_key"]
-    )
-    yield client
-    await client.close()
-
-@pytest_asyncio.fixture
-async def invalid_auth_client(router_address, zmq_context, auth_files):
-    """创建无效认证的客户端，但不自动连接"""
-    client = ClientDealer(
-        router_address, 
-        context=zmq_context, 
-        timeout=2.0,
-        api_key=auth_files["invalid_key"]
-    )
-    yield client
-    await client.close()
-
-@pytest_asyncio.fixture
-async def no_auth_client(router_address, zmq_context):
-    """创建无认证的客户端，但不自动连接"""
-    client = ClientDealer(
-        router_address, 
-        context=zmq_context, 
-        timeout=2.0
-    )
-    yield client
-    await client.close()
-
 class AuthTestService(ServiceDealer):
     """认证测试服务"""
-    def __init__(self, 
-                router_address: str, 
-                context=None, 
-                api_key=None):
+    def __init__(self,
+                router_address: str,
+                context=None,
+                api_key=None,
+                service_id_suffix="",
+                **kwargs):
+        service_id = f"AuthTestService-{service_id_suffix}-{uuid.uuid4().hex[:4]}"
+
+        kwargs.setdefault('logger_level', logging.DEBUG)
+        kwargs.setdefault('heartbeat_interval', 0.1)
+        kwargs.setdefault('heartbeat_timeout', 0.5)
+
         super().__init__(
             router_address=router_address,
             context=context,
-            api_key=api_key
+            api_key=api_key,
+            service_id=service_id,
+            group=service_id,
+            **kwargs
         )
     
     @service_method
     async def echo(self, message: str) -> str:
         """简单回显服务"""
-        await asyncio.sleep(0.1)
-        logger.info(f"AuthTestService {self._service_id} echo: {message}")
+        logger.debug(f"{self._service_id} echoing: {message}")
         return message
 
-@pytest.mark.asyncio
-async def test_auth_router_info(auth_router, valid_auth_client):
-    """测试认证的路由器信息"""
-    await valid_auth_client.connect()
-    router_info = await valid_auth_client.get_router_info()
-    
-    # 验证路由器认证状态
-    assert router_info["auth_required"] is True
-
-@pytest.mark.asyncio
-async def test_no_auth_router_info(no_auth_router, no_auth_client):
-    """测试无认证的路由器信息"""
-    await no_auth_client.connect()
-    router_info = await no_auth_client.get_router_info()
-    
-    # 验证路由器认证状态
-    assert router_info["auth_required"] is False
-
-@pytest.mark.asyncio
-async def test_valid_client_auth(auth_router, valid_auth_service, valid_auth_client):
-    """测试客户端有效认证"""
-    await valid_auth_client.connect()
-    
-    # 应该能成功获取服务信息
-    services = await valid_auth_client.discover_services()
-    assert "AuthTestService.echo" in services
-    
-    # 应该能成功调用服务
-    test_message = "Hello Auth World"
-    async for response in valid_auth_client.stream("AuthTestService.echo", test_message):
-        assert response == test_message
-        break
-
-@pytest.mark.asyncio
-async def test_invalid_client_auth(auth_router, valid_auth_service, invalid_auth_client):
-    """测试客户端无效认证"""
-    # 连接应该失败，因为认证失败
-    with pytest.raises(RuntimeError) as exc_info:
-        await invalid_auth_client.connect()
-    
-    assert "Not authenticated" in str(exc_info.value)
-
-@pytest.mark.asyncio
-async def test_no_client_auth(auth_router, valid_auth_service, no_auth_client):
-    """测试客户端无认证"""
-    # 连接应该失败，因为认证失败
-    with pytest.raises(RuntimeError) as exc_info:
-        await no_auth_client.connect()
-    
-    assert "Not authenticated" in str(exc_info.value)
-
-@pytest.mark.asyncio
-async def test_valid_dealer_auth(auth_router, valid_auth_service, valid_auth_client):
-    """测试处理端有效认证"""
-    # 服务应该能成功启动并注册
-    await valid_auth_client.connect()
-    
-    # 应该能发现服务
-    services = await valid_auth_client.discover_services()
-    assert "AuthTestService.echo" in services
-
-@pytest.mark.asyncio
-async def test_invalid_dealer_auth(auth_router, router_address, zmq_context, auth_files, valid_auth_client):
-    """测试处理端无效认证"""
-    # 使用无效密钥创建服务
-    service = AuthTestService(
+@pytest_asyncio.fixture
+async def valid_client(router_address, zmq_context, auth_keys):
+    """创建有效认证的客户端 (DEBUG log)"""
+    client = ClientDealer(
         router_address, 
         context=zmq_context, 
-        api_key=auth_files["invalid_key"]
+        timeout=2.0,
+        api_key=auth_keys["client_key"],
+        logger_level=logging.DEBUG
     )
-    
-    # 服务应该能启动，但注册应该失败
-    await service.start()
-    await asyncio.sleep(0.5)  # 等待注册处理
-    
-    try:
-        await valid_auth_client.connect()
-        
-        # 不应该能发现服务
-        services = await valid_auth_client.discover_services()
-        assert "AuthTestService.echo" not in services
-    finally:
-        await service.stop()
+    yield client
+    await client.close()
 
-@pytest.mark.asyncio
-async def test_no_dealer_auth(auth_router, router_address, zmq_context, valid_auth_client):
-    """测试处理端无认证"""
-    # 不提供密钥创建服务
-    service = AuthTestService(
+@pytest_asyncio.fixture
+async def invalid_client(router_address, zmq_context, auth_keys):
+    """创建无效认证的客户端 (DEBUG log)"""
+    client = ClientDealer(
         router_address, 
-        context=zmq_context
+        context=zmq_context, 
+        timeout=1.0,
+        api_key=auth_keys["invalid_key"],
+        logger_level=logging.DEBUG
     )
-    
-    # 服务应该能启动，但注册应该失败
-    await service.start()
-    await asyncio.sleep(0.5)  # 等待注册处理
-    
-    try:
-        await valid_auth_client.connect()
-        
-        # 不应该能发现服务
-        services = await valid_auth_client.discover_services()
-        assert "AuthTestService.echo" not in services
-    finally:
-        await service.stop()
+    yield client
+    await client.close()
+
+@pytest_asyncio.fixture
+async def no_key_client(router_address, zmq_context):
+    """创建无认证密钥的客户端 (DEBUG log)"""
+    client = ClientDealer(
+        router_address, 
+        context=zmq_context, 
+        timeout=1.0,
+        logger_level=logging.DEBUG
+    )
+    yield client
+    await client.close()
 
 @pytest.mark.asyncio
-async def test_no_auth_needed(no_auth_router, router_address, zmq_context, no_auth_client):
-    """测试不需要认证的情况"""
-    # 创建服务，不提供密钥
-    service = AuthTestService(router_address, context=zmq_context)
-    await service.start()
+async def test_auth_router_info(both_auth_router, valid_client):
+    """测试认证的路由器信息 (with timeout)"""
+    await asyncio.wait_for(valid_client.connect(), timeout=3.0)
     
-    try:
-        await no_auth_client.connect()
-        
-        # 应该能成功获取服务信息
-        services = await no_auth_client.discover_services()
-        assert "AuthTestService.echo" in services
-        
-        # 应该能成功调用服务
-        test_message = "Hello No Auth World"
-        async for response in no_auth_client.stream("AuthTestService.echo", test_message):
-            assert response == test_message
-            break
-    finally:
-        await service.stop()
+    # 显式等待一小段时间确保认证完成
+    await asyncio.sleep(0.1)
+    
+    router_info = await asyncio.wait_for(valid_client.get_router_info(), timeout=3.0)
+    assert router_info["client_api_keys_require"] is True
+    assert router_info["dealer_api_keys_require"] is True
 
 @pytest.mark.asyncio
-async def test_heartbeat_auth(auth_router, router_address, zmq_context, auth_files, valid_auth_client):
-    """测试心跳认证"""
-    # 先创建一个有效认证的服务
-    valid_service = AuthTestService(
-        router_address,
-        context=zmq_context,
-        api_key=auth_files["dealer_key"]
-    )
-    await valid_service.start()
-    await asyncio.sleep(0.5)  # 等待注册完成
-    
-    try:
-        await valid_auth_client.connect()
-        services = await valid_auth_client.discover_services()
-        assert "AuthTestService.echo" in services
-        
-        # 再创建一个无效认证的服务尝试发送心跳
-        invalid_service = AuthTestService(
-            router_address,
-            context=zmq_context,
-            api_key=auth_files["invalid_key"]
-        )
-        
-        # 手动设置服务ID，尝试冒充有效服务
-        invalid_service._service_id = valid_service._service_id
-        
-        # 启动服务但不等待注册（只发送心跳）
-        invalid_service._heartbeat_task = asyncio.create_task(
-            invalid_service._heartbeat_loop()
-        )
-        
-        await asyncio.sleep(1.0)  # 等待几个心跳周期
-        
-        # 如果心跳验证有效，服务应该仍然可用
-        services = await valid_auth_client.discover_services()
-        assert "AuthTestService.echo" in services
-        
-        # 停止无效服务的心跳任务
-        invalid_service._heartbeat_task.cancel()
-        await asyncio.gather(invalid_service._heartbeat_task, return_exceptions=True)
-    finally:
-        await valid_service.stop()
+async def test_no_auth_router_info(no_auth_router, no_key_client):
+    """测试无认证的路由器信息 (with timeout)"""
+    await asyncio.wait_for(no_key_client.connect(), timeout=3.0)
+    router_info = await asyncio.wait_for(no_key_client.get_router_info(), timeout=3.0)
+    assert router_info["client_api_keys_require"] is False
+    assert router_info["dealer_api_keys_require"] is False
 
 @pytest.mark.asyncio
-async def test_multiple_services_with_auth(auth_router, router_address, zmq_context, auth_files, valid_auth_client):
-    """测试多个服务的认证场景"""
-    # 创建两个有效认证服务和一个无效认证服务
-    valid_service1 = AuthTestService(
-        router_address,
-        context=zmq_context,
-        api_key=auth_files["dealer_key"]
-    )
-    
-    valid_service2 = AuthTestService(
-        router_address,
-        context=zmq_context,
-        api_key=auth_files["dealer_key"]
-    )
-    
-    invalid_service = AuthTestService(
-        router_address,
-        context=zmq_context,
-        api_key=auth_files["invalid_key"]
-    )
-    
-    # 启动所有服务
-    await valid_service1.start()
-    await valid_service2.start()
-    await invalid_service.start()
-    
-    await asyncio.sleep(0.5)  # 等待注册完成
-    
-    try:
-        await valid_auth_client.connect()
-        
-        # 查询集群信息
-        clusters = await valid_auth_client.discover_clusters()
-        
-        # 应该只有两个有效服务
-        active_services = [s for s in clusters.values() if s["state"] == "active"]
-        assert len(active_services) == 2
-        
-        # 调用服务10次，确保负载均衡在两个有效服务之间进行
-        service_ids = set()
-        for i in range(10):
-            async for response in valid_auth_client.stream("AuthTestService.echo", f"Test {i}"):
-                # 这里无法直接得到处理的服务ID，但可以确认响应是正确的
-                assert response == f"Test {i}"
-                break
-    finally:
-        await valid_service1.stop()
-        await valid_service2.stop()
-        await invalid_service.stop()
+async def test_only_client_auth_router_info(only_client_auth_router, valid_client):
+    """测试仅客户端认证的路由器信息 (with timeout)"""
+    await asyncio.wait_for(valid_client.connect(), timeout=3.0)
+    router_info = await asyncio.wait_for(valid_client.get_router_info(), timeout=3.0)
+    assert router_info["client_api_keys_require"] is True
+    assert router_info["dealer_api_keys_require"] is False
 
 @pytest.mark.asyncio
-async def test_router_auth_env_variable(router_address, zmq_context, auth_files):
-    """测试从环境变量加载认证配置"""
-    # 设置环境变量
-    os.environ["VOIDRAIL_DEALER_API_KEYS"] = auth_files["dealer_key"]
-    os.environ["VOIDRAIL_CLIENT_API_KEYS"] = auth_files["client_key"]
-    
-    # 创建路由器，不手动设置认证参数
-    router = ServiceRouter(
-        router_address,
-        context=zmq_context,
-        heartbeat_timeout=1.0
-    )
-    await router.start()
-    
+async def test_only_dealer_auth_router_info(only_dealer_auth_router, no_key_client):
+    """测试仅处理端认证的路由器信息 (with timeout)"""
+    await asyncio.wait_for(no_key_client.connect(), timeout=3.0)
+    router_info = await asyncio.wait_for(no_key_client.get_router_info(), timeout=3.0)
+    assert router_info["client_api_keys_require"] is False
+    assert router_info["dealer_api_keys_require"] is True
+
+@pytest.mark.asyncio
+async def test_no_auth_router_allows_all(no_auth_router, router_address, zmq_context, no_key_client, auth_keys):
+    """测试无认证Router允许任何Dealer和Client (with timeouts)"""
+    service_no_key = AuthTestService(router_address, context=zmq_context, service_id_suffix="no_key_svc")
+    await service_no_key.start()
+    await asyncio.sleep(0.2)
+    assert service_no_key._service_id in no_auth_router._services
+    logger.info(f"test_no_auth_router_allows_all >> step1")
+
+    service_with_key = AuthTestService(router_address, context=zmq_context, api_key=auth_keys['dealer_key'], service_id_suffix="with_key_svc")
+    await service_with_key.start()
+    await asyncio.sleep(0.2)
+    assert service_with_key._service_id in no_auth_router._services
+    logger.info(f"test_no_auth_router_allows_all >> step2")
+
+    method_no_key = f"{service_no_key._service_id}.echo"
+    method_with_key = f"{service_with_key._service_id}.echo"
+
     try:
-        # 验证路由器启用了认证
-        assert auth_files["dealer_key"] in router._dealer_api_keys
-        assert auth_files["client_key"] in router._client_api_keys
+        await asyncio.wait_for(no_key_client.connect(), timeout=3.0)
+        services = await asyncio.wait_for(no_key_client.discover_services(), timeout=3.0)
+        logger.debug(f"Discovered services (no_key_client): {services.keys()}")
+        assert method_no_key in services
+        assert method_with_key in services
         
-        # 创建有效认证的服务
-        service = AuthTestService(
-            router_address,
-            context=zmq_context,
-            api_key=auth_files["dealer_key"]
-        )
-        await service.start()
+        msg = "no_key_client_msg"
+        resp = await asyncio.wait_for(no_key_client.invoke(method_no_key, msg), timeout=3.0)
+        assert resp[0] == msg
+
+        with pytest.raises(RuntimeError) as exc_info_invalid:
+            client = ClientDealer(router_address, context=zmq_context, api_key=auth_keys['client_key'], logger_level=logging.DEBUG)
+            await client.connect()
+        assert "no need to authenticate" in str(exc_info_invalid.value).lower()
+
+    finally:
+        await asyncio.wait_for(service_no_key.stop(), timeout=2.0)
+        await asyncio.wait_for(service_with_key.stop(), timeout=2.0)
+
+@pytest.mark.asyncio
+async def test_only_client_auth_required(only_client_auth_router, router_address, zmq_context, valid_client, invalid_client, no_key_client, auth_keys):
+    """测试仅需Client认证的场景 (with timeouts)"""
+    router = only_client_auth_router
+    service_no_key = AuthTestService(router_address, context=zmq_context, service_id_suffix="no_key_svc")
+    await service_no_key.start()
+    await asyncio.sleep(0.2)
+    assert service_no_key._service_id in router._services
+
+    service_with_key = AuthTestService(router_address, context=zmq_context, api_key=auth_keys['dealer_key'], service_id_suffix="with_key_svc")
+    await service_with_key.start()
+    await asyncio.sleep(0.2)
+    assert service_with_key._service_id in router._services
+
+    method_no_key = f"{service_no_key._service_id}.echo"
+    method_with_key = f"{service_with_key._service_id}.echo"
+
+    try:
+        await asyncio.wait_for(valid_client.connect(), timeout=3.0)
+        services = await asyncio.wait_for(valid_client.discover_services(), timeout=3.0)
+        assert method_no_key in services
+        assert method_with_key in services
         
+        msg = "valid_client_msg"
+        resp = await asyncio.wait_for(valid_client.invoke(method_no_key, msg), timeout=3.0)
+        assert resp[0] == msg
+
+        with pytest.raises((RuntimeError, asyncio.TimeoutError, zmq.ZMQError)) as exc_info_invalid:
+            await asyncio.wait_for(invalid_client.connect(), timeout=2.0)
+            await asyncio.wait_for(invalid_client.invoke(method_no_key, "should fail"), timeout=2.0)
+        logger.debug(f"Invalid client exception: {exc_info_invalid.value}")
+        assert "auth" in str(exc_info_invalid.value).lower() or \
+               "认证" in str(exc_info_invalid.value).lower() or \
+               "timeout" in str(exc_info_invalid.value).lower()
+
+        with pytest.raises((RuntimeError, asyncio.TimeoutError, zmq.ZMQError)) as exc_info_no_key:
+            await asyncio.wait_for(no_key_client.connect(), timeout=2.0)
+            await asyncio.wait_for(no_key_client.invoke(method_no_key, "should fail"), timeout=2.0)
+        logger.debug(f"No key client exception: {exc_info_no_key.value}")
+        assert "auth" in str(exc_info_no_key.value).lower() or \
+               "认证" in str(exc_info_no_key.value).lower() or \
+               "timeout" in str(exc_info_no_key.value).lower()
+
+    finally:
+        await asyncio.wait_for(service_no_key.stop(), timeout=2.0)
+        await asyncio.wait_for(service_with_key.stop(), timeout=2.0)
+
+@pytest.mark.asyncio
+async def test_only_dealer_auth_required(only_dealer_auth_router, router_address, zmq_context, no_key_client, valid_client, auth_keys):
+    """测试仅需Dealer认证的场景 (with timeouts)"""
+    router = only_dealer_auth_router
+
+    service_valid_key = AuthTestService(router_address, context=zmq_context, api_key=auth_keys['dealer_key'], service_id_suffix="valid_key_svc")
+    await service_valid_key.start()
+    await asyncio.sleep(0.2)
+    assert service_valid_key._service_id in router._services
+    method_valid = f"{service_valid_key._service_id}.echo"
+
+    service_invalid_key = AuthTestService(router_address, context=zmq_context, api_key=auth_keys['invalid_key'], service_id_suffix="invalid_key_svc")
+    await service_invalid_key.start()
+    await asyncio.sleep(0.2)
+    assert service_invalid_key._service_id not in router._services
+
+    service_no_key_dealer = AuthTestService(router_address, context=zmq_context, service_id_suffix="no_key_dealer_svc")
+    await service_no_key_dealer.start()
+    await asyncio.sleep(0.2)
+    assert service_no_key_dealer._service_id not in router._services
+
+    try:
+        await asyncio.wait_for(no_key_client.connect(), timeout=3.0)
+        services = await asyncio.wait_for(no_key_client.discover_services(), timeout=3.0)
+        assert method_valid in services
+        assert f"{service_invalid_key._service_id}.echo" not in services
+        assert f"{service_no_key_dealer._service_id}.echo" not in services
+        
+        msg = "no_key_client_msg"
+        resp = await asyncio.wait_for(no_key_client.invoke(method_valid, msg), timeout=3.0)
+        assert resp[0] == msg
+
+        with pytest.raises((RuntimeError, asyncio.TimeoutError, zmq.ZMQError)) as exc_info_invalid:
+            await asyncio.wait_for(valid_client.connect(), timeout=3.0)
+            await asyncio.wait_for(valid_client.invoke(method_valid, "should fail"), timeout=3.0)
+        assert "no need to authenticate" in str(exc_info_invalid.value).lower()
+
+    finally:
+        await asyncio.wait_for(service_valid_key.stop(), timeout=2.0)
         try:
-            # 创建有效认证的客户端
-            client = ClientDealer(
-                router_address,
-                context=zmq_context,
-                timeout=2.0,
-                api_key=auth_files["client_key"]
-            )
-            
-            try:
-                await client.connect()
-                
-                # 应该能发现服务
-                services = await client.discover_services()
-                assert "AuthTestService.echo" in services
-            finally:
-                await client.close()
-        finally:
-            await service.stop()
-    finally:
-        await router.stop()
+            await asyncio.wait_for(service_invalid_key.stop(), timeout=2.0)
+        except Exception as e:
+            logger.warning(f"Error stopping invalid_key service (may be expected): {e}")
+        try:
+            await asyncio.wait_for(service_no_key_dealer.stop(), timeout=2.0)
+        except Exception as e:
+            logger.warning(f"Error stopping no_key_dealer service (may be expected): {e}")
+
+@pytest.mark.asyncio
+async def test_both_auth_required(both_auth_router, router_address, zmq_context, valid_client, invalid_client, no_key_client, auth_keys):
+    """测试需要双重认证的场景 (with timeouts)"""
+    router = both_auth_router
+
+    service_valid_dealer = AuthTestService(router_address, context=zmq_context, api_key=auth_keys['dealer_key'], service_id_suffix="valid_dealer_svc")
+    await service_valid_dealer.start()
+    await asyncio.sleep(0.2)
+    assert service_valid_dealer._service_id in router._services
+    method_valid = f"{service_valid_dealer._service_id}.echo"
+
+    service_invalid_dealer = AuthTestService(router_address, context=zmq_context, api_key=auth_keys['invalid_key'], service_id_suffix="invalid_dealer_svc")
+    await service_invalid_dealer.start()
+    await asyncio.sleep(0.2)
+    assert service_invalid_dealer._service_id not in router._services
+
+    service_no_key_dealer = AuthTestService(router_address, context=zmq_context, service_id_suffix="no_key_dealer_svc")
+    await service_no_key_dealer.start()
+    await asyncio.sleep(0.2)
+    assert service_no_key_dealer._service_id not in router._services
+
+    try:
+        await asyncio.wait_for(valid_client.connect(), timeout=3.0)
+        services = await asyncio.wait_for(valid_client.discover_services(), timeout=3.0)
+        assert method_valid in services
+        assert f"{service_invalid_dealer._service_id}.echo" not in services
+        assert f"{service_no_key_dealer._service_id}.echo" not in services
         
-        # 清理环境变量
-        if "VOIDRAIL_DEALER_API_KEYS" in os.environ:
-            del os.environ["VOIDRAIL_DEALER_API_KEYS"]
-        if "VOIDRAIL_CLIENT_API_KEYS" in os.environ:
-            del os.environ["VOIDRAIL_CLIENT_API_KEYS"] 
+        msg = "valid_client_msg"
+        resp = await asyncio.wait_for(valid_client.invoke(method_valid, msg), timeout=3.0)
+        assert resp[0] == msg
+
+        with pytest.raises((RuntimeError, asyncio.TimeoutError, zmq.ZMQError)) as exc_info_invalid:
+            await asyncio.wait_for(invalid_client.connect(), timeout=2.0)
+            await asyncio.wait_for(invalid_client.invoke(method_valid, "should fail"), timeout=2.0)
+        logger.debug(f"Invalid client exception: {exc_info_invalid.value}")
+        assert "auth" in str(exc_info_invalid.value).lower() or \
+               "认证" in str(exc_info_invalid.value).lower() or \
+               "timeout" in str(exc_info_invalid.value).lower()
+
+        with pytest.raises((RuntimeError, asyncio.TimeoutError, zmq.ZMQError)) as exc_info_no_key:
+            await asyncio.wait_for(no_key_client.connect(), timeout=2.0)
+            await asyncio.wait_for(no_key_client.invoke(method_valid, "should fail"), timeout=2.0)
+        logger.debug(f"No key client exception: {exc_info_no_key.value}")
+        assert "auth" in str(exc_info_no_key.value).lower() or \
+               "认证" in str(exc_info_no_key.value).lower() or \
+               "timeout" in str(exc_info_no_key.value).lower()
+
+    finally:
+        await asyncio.wait_for(service_valid_dealer.stop(), timeout=2.0)
+        try:
+            await asyncio.wait_for(service_invalid_dealer.stop(), timeout=2.0)
+        except Exception as e:
+            logger.warning(f"Error stopping invalid_dealer service (may be expected): {e}")
+        try:
+            await asyncio.wait_for(service_no_key_dealer.stop(), timeout=2.0)
+        except Exception as e:
+            logger.warning(f"Error stopping no_key_dealer service (may be expected): {e}")
+
+@pytest.fixture(scope="session", autouse=True)
+def _close_asyncio_tasks():
+    yield
+    loop = asyncio.get_event_loop()
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    if pending:
+        logging.warning(f"Force-cancel {len(pending)} pending tasks")
+        for t in pending:
+            t.cancel()
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True)) 

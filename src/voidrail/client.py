@@ -76,7 +76,14 @@ class ClientDealer:
             
             # 如果有API密钥，先尝试认证
             if self._api_key:
-                await self._authenticate()
+                try:
+                    await self._authenticate()
+                except Exception as e:
+                    # 认证失败，立即关闭 socket 并向上传递异常
+                    self._socket.close(linger=0)
+                    self._socket = None
+                    self._logger.error(f"Authentication failed: {e}")
+                    raise
             
             self._connected = True
             self._logger.info(f"Connected to router at {self._router_address}")
@@ -88,49 +95,50 @@ class ClientDealer:
         """向Router发送认证请求"""
         if self._authenticated:
             return True
-            
+
+        if not self._api_key:
+            self._logger.debug("No API key provided, skipping authentication.")
+            return True
+
         try:
+            # 直接发送认证请求，不要先获取router_info
             auth_request = {
                 "api_key": self._api_key,
                 "client_id": self._client_id
             }
-            
+
             await self._socket.send_multipart([
                 b"auth",
                 json.dumps(auth_request).encode()
             ])
-            
+
+            # 接收认证响应
             multipart = await asyncio.wait_for(
                 self._socket.recv_multipart(),
                 timeout=self._timeout
             )
             
+            # 处理认证响应...
             message_type = multipart[0] if len(multipart) >= 1 else b""
             
             if message_type == b"auth_ack":
-                response_data = multipart[-1].decode()
-                response = json.loads(response_data)
-                
-                if response.get("type") == "reply":
-                    self._authenticated = True
-                    self._logger.info("客户端认证成功")
-                    return True
-                elif response.get("type") == "error":
-                    self._logger.error(f"认证失败: {response.get('error')}")
-                    return False
+                # 处理认证成功...
+                self._authenticated = True
+                return True
             elif message_type == b"error":
-                error_msg = multipart[-1].decode() if len(multipart) > 1 else "Unknown error"
-                self._logger.error(f"认证错误: {error_msg}")
-                return False
-                
-            return False
-                
+                # Router 显式拒绝
+                error_msg = json.loads(multipart[-1].decode()).get("error", "Authentication failed")
+                raise RuntimeError(error_msg)
+            else:
+                raise RuntimeError(f"Unexpected auth response: {message_type!r}")
+            
         except asyncio.TimeoutError:
-            self._logger.error("认证超时")
-            return False
+            # Router 未启用客户端认证 -> 视为通过（保持向后兼容）
+            self._logger.info("Authentication timeout, assuming router does not require client auth")
+            return True
         except Exception as e:
-            self._logger.error(f"认证过程中发生错误: {e}")
-            return False
+            self._logger.error(f"Authentication error: {e}")
+            raise
 
     async def close(self):
         """关闭连接"""

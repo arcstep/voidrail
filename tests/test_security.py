@@ -9,8 +9,9 @@ import logging
 from pathlib import Path
 import json
 import zmq.auth
+import time
 
-from voidrail import ServiceRouter, ServiceDealer, ClientDealer, service_method
+from voidrail import ServiceRouter, ServiceDealer, ClientDealer, service_method, ServiceState
 from voidrail.security import generate_curve_keys
 
 # 启用更详细的日志记录
@@ -400,3 +401,114 @@ async def test_unauthorized_client_rejection(router_address, zmq_context, server
             await service.stop()
     finally:
         await router.stop()
+
+@pytest.mark.asyncio
+async def test_secure_echo_with_auth(router_address, zmq_context, server_keys):
+    """测试使用ClientDealer/ServiceDealer进行带API Key认证的CURVE加密通信"""
+    logger.debug("开始带认证的CURVE加密通信测试 (使用框架类)")
+
+    VALID_API_KEY = f"secure-key-{uuid.uuid4().hex}" # 每次测试使用唯一Key
+
+    # 1. 启动带认证和CURVE的Router
+    #    Router 需要配置服务器密钥文件以启用CURVE
+    #    Router 需要配置 client_api_keys 以启用客户端API Key认证
+    router = ServiceRouter(
+        router_address,
+        context=zmq_context,
+        curve_server_key_file=server_keys["secret_file"],
+        client_api_keys=[VALID_API_KEY], # <--- 启用客户端API Key认证
+        heartbeat_timeout=2.0, # 使用稍长的超时增加稳定性
+        logger_level=logging.DEBUG
+    )
+    await router.start()
+    await asyncio.sleep(0.5) # 等待Router启动
+    logger.debug(f"带认证的Router启动成功，地址: {router_address}")
+
+    # 2. 启动带CURVE的服务
+    #    ServiceDealer 需要配置服务器公钥以启用CURVE客户端模式
+    #    注意：ServiceDealer注册本身通常不需要API Key (除非Router配置了dealer_api_keys)
+    service = SecureEchoService(
+        router_address,
+        context=zmq_context,
+        curve_server_key=server_keys["public_key"], # Dealer连接Router需要服务器公钥
+        heartbeat_interval=0.5,
+        heartbeat_timeout=2.0,
+        logger_level=logging.DEBUG
+    )
+    service_id = service._service_id # 获取服务ID用于日志
+    logger.debug(f"启动服务 {service_id}...")
+    await service.start()
+    # 等待服务注册完成
+    # 可以轮询 Router 的服务列表来确认，而不是固定等待
+    for _ in range(10): # 最多等待1秒
+        if service_id in router._services and router._services[service_id].state == ServiceState.ACTIVE:
+             logger.debug(f"服务 {service_id} 已在Router注册并激活")
+             break
+        await asyncio.sleep(0.1)
+    else:
+         pytest.fail(f"服务 {service_id} 未能在预期时间内注册到Router")
+
+
+    # 3. 创建带正确API Key和CURVE的客户端
+    #    ClientDealer 需要配置服务器公钥以启用CURVE
+    #    ClientDealer 需要配置正确的 api_key 以通过Router认证
+    authorized_client = ClientDealer(
+        router_address,
+        context=zmq_context,
+        timeout=5.0,
+        curve_server_key=server_keys["public_key"],
+        api_key=VALID_API_KEY, # <--- 提供正确的API Key
+        logger_level=logging.DEBUG
+    )
+    logger.debug(f"创建授权客户端 (ID: {authorized_client._client_id})，API Key: {VALID_API_KEY}")
+
+    # 4. 创建带错误API Key和CURVE的客户端 (用于验证拒绝)
+    unauthorized_client = ClientDealer(
+        router_address,
+        context=zmq_context,
+        timeout=2.0, # 短超时即可
+        curve_server_key=server_keys["public_key"],
+        api_key="wrong-key", # <--- 提供错误的API Key
+        logger_level=logging.DEBUG
+    )
+    logger.debug(f"创建未授权客户端 (ID: {unauthorized_client._client_id})，API Key: wrong-key")
+
+    try:
+        # 5. 测试授权客户端的通信
+        #    调用 ClientDealer 的方法，它会处理连接、认证和消息格式化
+        logger.debug(f"测试授权客户端 {authorized_client._client_id} 调用 SecureEchoService.echo...")
+        test_message = f"安全消息 @ {time.time()}"
+        response = None
+        # 使用 invoke 获取单个回复
+        response_list = await authorized_client.invoke("SecureEchoService.echo", test_message)
+        assert len(response_list) == 1, "Invoke 对于非流式方法应返回包含一个元素的列表"
+        response = response_list[0]
+
+        assert response == test_message, f"授权客户端的回显消息不匹配, 期望 '{test_message}', 收到 '{response}'"
+        logger.info(f"授权客户端 ({authorized_client._client_id}) 通信成功")
+
+        # 6. 测试未授权客户端被拒绝
+        logger.debug(f"测试未授权客户端 {unauthorized_client._client_id} 调用 SecureEchoService.echo...")
+        with pytest.raises(Exception) as exc_info:
+            # 尝试调用服务，预期失败。失败可能发生在 connect/authenticate 或 invoke 阶段
+            # invoke 会触发 connect（如果未连接），connect 会触发 _authenticate
+            await unauthorized_client.invoke("SecureEchoService.echo", "此消息不应发送")
+
+        # 检查异常类型或消息。认证失败可能导致超时或特定的运行时错误
+        logger.info(f"未授权客户端 ({unauthorized_client._client_id}) 按预期失败: {exc_info.type.__name__} - {exc_info.value}")
+        # 异常消息应该包含认证失败、超时或找不到服务等信息
+        error_msg = str(exc_info.value).lower()
+        assert "auth" in error_msg or \
+               "failed" in error_msg or \
+               "timeout" in error_msg or \
+               "not found" in error_msg or \
+               "认证" in error_msg, \
+               f"异常信息 '{error_msg}' 应表明认证失败或超时"
+
+    finally:
+        logger.debug("清理测试资源...")
+        await authorized_client.close()
+        await unauthorized_client.close()
+        await service.stop()
+        await router.stop()
+        logger.debug("测试清理完成")
