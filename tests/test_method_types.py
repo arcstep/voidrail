@@ -5,29 +5,20 @@ import logging
 import time
 import zmq.asyncio
 
-from voidrail import ServiceDealer, RouterMode, ServiceRouter, ClientDealer, service_method
+from voidrail import ServiceDealer, ServiceRouter, ClientDealer, service_method
 
 logger = logging.getLogger(__name__)
 
 @pytest.fixture(scope="module")
 def router_address():
     """测试用路由器地址"""
-    return "inproc://router_method_types_test"
-
-@pytest.fixture
-def zmq_context():
-    """创建共享的ZMQ Context"""
-    context = zmq.asyncio.Context.instance()
-    yield context
+    return "tcp://127.0.0.1:5555"
 
 @pytest_asyncio.fixture
-async def router(router_address, zmq_context):
+async def router(router_address):
     """创建并启动路由器"""
     router = ServiceRouter(
-        router_address,
-        context=zmq_context,
-        router_mode=RouterMode.LOAD_BALANCE,
-        heartbeat_timeout=5.0
+        router_address
     )
     await router.start()
     yield router
@@ -39,9 +30,7 @@ class MyMethodService(ServiceDealer):
     def __init__(self, router_address: str, context=None):
         super().__init__(
             router_address=router_address,
-            context=context,
-            heartbeat_interval=0.5,
-            heartbeat_timeout=2.0
+            heartbeat_interval=0.5
         )
 
     @service_method
@@ -70,16 +59,16 @@ class MyMethodService(ServiceDealer):
 
 # 直接在测试函数中处理所有逻辑，避免复杂的fixture依赖
 @pytest.mark.asyncio
-async def test_method_types(router_address, zmq_context, router):
+async def test_method_types(router_address, router):
     """测试不同类型方法的处理"""
     # 创建服务
-    service = MyMethodService(router_address, context=zmq_context)
-    await service.start()
+    service = MyMethodService(router_address)
+    service.start()
     await asyncio.sleep(1.0)  # 等待服务注册
     
     try:
         # 创建客户端
-        client = ClientDealer(router_address, context=zmq_context, timeout=5.0)
+        client = ClientDealer(router_address, timeout=5.0)
         
         try:
             # 先确认服务已注册并可发现
@@ -119,4 +108,4 @@ async def test_method_types(router_address, zmq_context, router):
             await client.close()
             
     finally:
-        await service.stop() 
+        service.stop() 
