@@ -338,8 +338,12 @@ def dealer(host, port, module, class_names, heartbeat, api_key, logger_level):
         click.echo(f"启动 Dealer 服务: {class_name}")
 
         # 同步启动 Dealer 服务
-        service.start()
-        click.echo(f"服务 {class_name} 已启动并连接到 {address}")
+        success = service.start()
+        
+        if success:
+            click.echo(f"服务 {class_name} 已启动并连接到 {address}")
+        else:
+            click.echo(f"服务 {class_name} 首次连接失败，已转为自动重连模式。当Router启动后会自动连接。")
 
         # 注册 SIGINT/SIGTERM 处理，一次信号优雅退出
         def _stop_handler(signum, frame):

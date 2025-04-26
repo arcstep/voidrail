@@ -513,40 +513,54 @@ class ServiceRouter:
                             await self._send_error(from_id_bytes, "Registration failed: invalid API key or other issue")
                     
                 elif message_type == "heartbeat":
-                    # 处理心跳消息
-                    heartbeat_data = {}
-                    if len(multipart) >= 3:
-                        try:
-                            heartbeat_data = json.loads(multipart[2].decode())
-                        except:
-                            pass
-                    
-                    # 如果心跳数据中包含处理中请求数
                     if from_id in self._services.keys():
-                        service = self._services[from_id]
+                        # 正常处理...
+                        heartbeat_data = {}
+                        if len(multipart) >= 3:
+                            try:
+                                heartbeat_data = json.loads(multipart[2].decode())
+                            except:
+                                pass
                         
-                        # 更新处理负载信息
-                        current_load = heartbeat_data.get("processing_requests", 0)
-                        if current_load > 0:
-                            # 记录忙碌开始时间(如果之前非忙碌)
-                            if service.current_load == 0:
-                                self._service_busy_since[from_id] = time()
-                            service.current_load = current_load
+                        # 如果心跳数据中包含处理中请求数
+                        if from_id in self._services.keys():
+                            service = self._services[from_id]
+                            
+                            # 更新处理负载信息
+                            current_load = heartbeat_data.get("processing_requests", 0)
+                            if current_load > 0:
+                                # 记录忙碌开始时间(如果之前非忙碌)
+                                if service.current_load == 0:
+                                    self._service_busy_since[from_id] = time()
+                                service.current_load = current_load
+                            else:
+                                # 清除忙碌状态
+                                if from_id in self._service_busy_since:
+                                    del self._service_busy_since[from_id]
+                                service.current_load = 0
+                            
+                            # 发送心跳确认
+                            await self._socket.send_multipart([
+                                from_id_bytes,
+                                b"heartbeat_ack",
+                                b""
+                            ])
                         else:
-                            # 清除忙碌状态
-                            if from_id in self._service_busy_since:
-                                del self._service_busy_since[from_id]
-                            service.current_load = 0
-                        
-                        # 发送心跳确认
+                            # 服务未注册但发送了心跳 - 告知它需要重新注册
+                            await self._socket.send_multipart([
+                                from_id_bytes,
+                                b"reregister_required",
+                                b""
+                            ])
+                            self._logger.warning(f"Received heartbeat from unregistered service: {from_id}, instructed to re-register")
+                    else:
+                        # 服务未注册但发送了心跳 - 告知它需要重新注册
                         await self._socket.send_multipart([
                             from_id_bytes,
-                            b"heartbeat_ack",
+                            b"reregister_required",
                             b""
                         ])
-                    else:
-                        # 未注册的服务发送心跳
-                        self._logger.warning(f"Received heartbeat from unregistered service: {from_id}")
+                        self._logger.warning(f"Received heartbeat from unregistered service: {from_id}, instructed to re-register")
                 
                 elif message_type == "clusters":
                     # 客户端认证检查 - 检查 self._client_api_keys 是否非空
