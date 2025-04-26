@@ -1,8 +1,8 @@
 import pytest
 import pytest_asyncio
 import asyncio
-import zmq.asyncio
 import time
+import random
 from collections import defaultdict
 import logging
 
@@ -20,30 +20,24 @@ def setup_logging(caplog):
     caplog.set_level(logging.INFO)
 
 @pytest.fixture()
-def zmq_context():
-    """创建共享的 ZMQ Context"""
-    context = zmq.asyncio.Context.instance()  # 使用单例模式获取 Context
-    yield context
-
-@pytest.fixture()
 def router_address():
-    """返回路由器地址"""
-    return "inproc://router_fifo_test"
+    """返回路由器地址，使用随机TCP端口"""
+    port = random.randint(45000, 49999)
+    return f"tcp://127.0.0.1:{port}"
 
 @pytest.fixture()
 def test_config():
     """测试配置"""
     return {
-        'heartbeat_timeout': 2.0,    # Router 心跳超时时间
+        'heartbeat_interval': 0.5,  # 心跳间隔
     }
 
 @pytest_asyncio.fixture
-async def router_fifo(router_address, zmq_context, test_config):
+async def router_fifo(router_address, test_config):
     """创建并启动FIFO模式路由器"""
     router = ServiceRouter(
         router_address, 
-        context=zmq_context,
-        heartbeat_timeout=test_config['heartbeat_timeout']
+        heartbeat_interval=test_config['heartbeat_interval']
     )
     await router.start()
     await asyncio.sleep(0.1)
@@ -54,12 +48,18 @@ async def router_fifo(router_address, zmq_context, test_config):
 
 class EchoService(ServiceDealer):
     """测试用服务实现"""
-    def __init__(self, router_address: str, context = None, heartbeat_timeout: float = 0.5):
+    def __init__(
+        self,
+        router_address: str,
+        heartbeat_interval: float = 0.2,
+        **kwargs
+    ):
+        if 'heartbeat_interval' not in kwargs:
+            kwargs['heartbeat_interval'] = heartbeat_interval
         super().__init__(
             router_address=router_address,
-            context=context
+            **kwargs
         )
-        self.heartbeat_timeout = heartbeat_timeout
 
     @service_method
     async def delay_echo(self, message: str, delay: float = 0.1) -> dict:
@@ -72,48 +72,48 @@ class EchoService(ServiceDealer):
         }
 
 @pytest_asyncio.fixture
-async def service(router_fifo, router_address, zmq_context, test_config):
+async def service(router_fifo, router_address, test_config):
     """创建并启动测试服务1"""
     service = EchoService(
         router_address,
-        context=zmq_context,
-        heartbeat_timeout=test_config['heartbeat_timeout']
+        heartbeat_interval=test_config['heartbeat_interval']
     )
-    await service.start()
+    # 同步启动
+    service.start()
     yield service
-    await service.stop()
-    await asyncio.sleep(0.1)
+    # 同步停止
+    service.stop()
 
 @pytest_asyncio.fixture
-async def service2(router_fifo, router_address, zmq_context, test_config):
+async def service2(router_fifo, router_address, test_config):
     """创建并启动测试服务2"""
     service = EchoService(
         router_address,
-        context=zmq_context,
-        heartbeat_timeout=test_config['heartbeat_timeout']
+        heartbeat_interval=test_config['heartbeat_interval']
     )
-    await service.start()
+    # 同步启动
+    service.start()
     yield service
-    await service.stop()
-    await asyncio.sleep(0.1)
+    # 同步停止
+    service.stop()
 
 @pytest_asyncio.fixture
-async def service3(router_fifo, router_address, zmq_context, test_config):
+async def service3(router_fifo, router_address, test_config):
     """创建并启动测试服务3"""
     service = EchoService(
         router_address,
-        context=zmq_context,
-        heartbeat_timeout=test_config['heartbeat_timeout']
+        heartbeat_interval=test_config['heartbeat_interval']
     )
-    await service.start()
+    # 同步启动
+    service.start()
     yield service
-    await service.stop()
-    await asyncio.sleep(0.1)
+    # 同步停止
+    service.stop()
 
 @pytest_asyncio.fixture
-async def client(router_fifo, router_address, zmq_context):
+async def client(router_fifo, router_address):
     """创建客户端"""
-    client = ClientDealer(router_address, context=zmq_context, timeout=2.0)
+    client = ClientDealer(router_address, timeout=2.0)
     try:
         yield client
     finally:
@@ -147,6 +147,10 @@ async def test_fifo_parallel_processing(router_fifo, service, service2, service3
     # 创建请求记录器
     start_time = time.time()
     
+    # 预先缓存服务发现信息，避免并发调用导致超时
+    await client.discover_services()
+    await asyncio.sleep(0.1)
+    
     # 发送6个请求，前3个耗时长，后3个耗时短
     tasks = []
     for i in range(6):
@@ -164,12 +168,15 @@ async def test_fifo_parallel_processing(router_fifo, service, service2, service3
     logger.info(f"总处理时间: {total_time}秒")
     assert 0.55 < total_time < 0.9, "总处理时间应该接近0.6秒"
 
-
 @pytest.mark.asyncio
 async def test_fifo_load_imbalance(router_fifo, service, service2, service3, client):
     """测试FIFO模式下，当有2个长任务和4个短任务时，所有短任务应该分配给同一个处理端"""
     # 创建请求记录器
     start_time = time.time()
+    
+    # 预先缓存服务发现信息，避免并发调用导致超时
+    await client.discover_services()
+    await asyncio.sleep(0.1)
     
     # 分两批发送请求：前2个长任务，后4个短任务
     # 长任务：处理时间为0.5秒

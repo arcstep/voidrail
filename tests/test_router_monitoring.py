@@ -1,16 +1,13 @@
 import pytest
 import pytest_asyncio
 import asyncio
-import zmq.asyncio
 import time
 import logging
+import random
 
 from voidrail import ServiceRouter, ServiceDealer, ClientDealer, service_method
 
 logger = logging.getLogger(__name__)
-
-# 定义路由器地址
-ROUTER_ADDRESS = "inproc://router_monitor_test"
 
 @pytest.fixture(autouse=True)
 def setup_logging(caplog):
@@ -22,34 +19,44 @@ def setup_logging(caplog):
     caplog.set_level(logging.INFO)
 
 @pytest.fixture()
-def zmq_context():
-    """创建共享的 ZMQ Context"""
-    context = zmq.asyncio.Context.instance()  # 使用单例模式获取 Context
-    yield context
+def router_address():
+    """返回唯一的路由器地址，使用随机TCP端口"""
+    port = random.randint(45000, 49999)
+    return f"tcp://127.0.0.1:{port}"
 
 @pytest_asyncio.fixture
-async def router_fifo(zmq_context):
+async def router_fifo(router_address):
     """创建并启动FIFO模式路由器"""
     router = ServiceRouter(
-        address=ROUTER_ADDRESS,
-        context=zmq_context,
-        heartbeat_timeout=0.5
+        address=router_address,
+        heartbeat_interval=0.5
     )
     await router.start()
     yield router
     await router.stop()
 
-
 @pytest_asyncio.fixture
-async def client_dealer(router_fifo, zmq_context):
+async def client_dealer(router_fifo, router_address):
     """创建客户端 - 用于FIFO模式测试"""
-    client = ClientDealer(ROUTER_ADDRESS, context=zmq_context)
+    client = ClientDealer(router_address)
     await client.connect()
     yield client
     await client.close()
 
 class MonitorTestService(ServiceDealer):
     """用于监控测试的简单服务"""
+    def __init__(
+        self,
+        router_address: str,
+        heartbeat_interval: float = 0.2,
+        **kwargs
+    ):
+        if 'heartbeat_interval' not in kwargs:
+            kwargs['heartbeat_interval'] = heartbeat_interval
+        super().__init__(
+            router_address=router_address,
+            **kwargs
+        )
     
     @service_method
     async def slow_echo(self, message):
@@ -67,7 +74,7 @@ async def test_router_info_fifo(client_dealer):
     assert "mode" in router_info
     assert router_info["mode"] == "fifo"  # 确认是FIFO模式
     assert "address" in router_info
-    assert "idle_heartbeat_timeout" in router_info
+    assert "idle_heartbeat_timeout" in router_info  # 名称沿用旧的，但内部已经调整
     assert "busy_heartbeat_timeout" in router_info
     assert "max_busy_without_heartbeat" in router_info
     assert "active_services_count" in router_info
@@ -78,11 +85,12 @@ async def test_router_info_fifo(client_dealer):
     logger.info(f"Router 信息: {router_info}")
 
 @pytest.mark.asyncio
-async def test_queue_status(client_dealer, zmq_context):
+async def test_queue_status(client_dealer, router_address):
     """测试获取队列状态功能"""
     # 创建一个慢服务，确保请求会在队列中等待
-    service = MonitorTestService(context=zmq_context, router_address=ROUTER_ADDRESS)
-    await service.start()
+    service = MonitorTestService(router_address=router_address)
+    # 同步启动
+    service.start()
     
     try:
         # 等待服务注册完成
@@ -131,4 +139,5 @@ async def test_queue_status(client_dealer, zmq_context):
             logger.error(f"Task error: {e}")
                 
     finally:
-        await service.stop() 
+        # 同步停止
+        service.stop() 
