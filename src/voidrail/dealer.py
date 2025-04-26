@@ -193,52 +193,64 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         self._registry    = dict(self.__class__._registry)
 
     # ---------------- 启动 / 停止 ----------------
+    def stop(self):
+        """同步停止服务：设置停止标志、发送下线通知并彻底清理资源"""
+        # 避免重复调用
+        if self._state in (DealerState.STOPPING, DealerState.STOPPED):
+            return
+        
+        # 先标记状态，防止新任务提交
+        self._state = DealerState.STOPPING
+        self._stop_event.set()  # 通知所有线程退出
+        
+        # 关闭套接字
+        if self._socket:
+            try:
+                # 尝试发送shutdown通知
+                self._socket.send_multipart([b"shutdown", b""], flags=zmq.NOBLOCK)
+                # 立即关闭socket，避免等待ACK
+                self._socket.close(linger=0)
+                self._socket = None
+            except Exception:
+                pass
+        
+        # 关闭线程池，防止新任务被接受
+        try:
+            # 先设置空队列，避免因有任务而阻塞
+            self._executor._work_queue.queue.clear()
+            self._executor.shutdown(wait=False)
+        except:
+            pass
+        
+        # 标记最终状态
+        self._state = DealerState.STOPPED
+        self._logger.info(f"<{self._service_id}> 服务已停止")
+
     def start(self) -> bool:
+        """同步启动：确保首次 (re)connect & register 完成后才返回"""
         if self._state != DealerState.INIT:
             self._logger.warning("%s 无法从状态 %s 启动", self._service_id, self._state)
             return False
+
+        try:
+            # 首次连接 & 注册（同步）
+            self._connect_and_register()
+        except Exception as e:
+            self._logger.error(f"<{self._service_id}> 首次连接/注册失败: {e}")
+            return False
+
+        # 启动后台循环线程
+        threading.Thread(target=self._message_loop,   name=f"{self._service_id}-msg",
+                         daemon=True).start()
+        threading.Thread(target=self._heartbeat_loop, name=f"{self._service_id}-heartbeat",
+                         daemon=True).start()
+        threading.Thread(target=self._reconnect_loop, name=f"{self._service_id}-reconnect",
+                         daemon=True).start()
+
         self._state = DealerState.RUNNING
-
-        # 建立连接并注册
-        self._connect_and_register()
-
-        # 后台线程：消息、心跳、重连
-        threading.Thread(target=self._message_loop,   name=f"{self._service_id}-msg",       daemon=True).start()
-        threading.Thread(target=self._heartbeat_loop, name=f"{self._service_id}-heartbeat", daemon=True).start()
-        threading.Thread(target=self._reconnect_loop, name=f"{self._service_id}-reconnect", daemon=True).start()
-
-        self._logger.info("%s DEALER 端已启动", self._service_id)
+        self._logger.info("%s DEALER 端已启动（同步）", self._service_id)
         return True
 
-    def stop(self):
-        if self._state in (DealerState.STOPPING, DealerState.STOPPED):
-            return
-        self._state = DealerState.STOPPING
-        self._stop_event.set()
-
-        # 通知 Router 下线：非阻塞等待 ACK，不再挂死
-        with self._socket_lock:
-            try:
-                self._socket.send_multipart([b"shutdown", b""])
-                # 非阻塞尝试接收 ACK
-                try:
-                    self._socket.recv_multipart(flags=zmq.NOBLOCK)
-                except zmq.Again:
-                    # ACK 未到，可能 Router 已断开
-                    self._logger.debug(f"<{self._service_id}> shutdown ACK 未到或超时，直接关闭 socket")
-            except Exception as e:
-                self._logger.warning(f"<{self._service_id}> 发送 shutdown 失败: {e}", exc_info=False)
-            finally:
-                # 强制关闭 socket，立即退出
-                try:
-                    self._socket.close(linger=0)
-                except Exception:
-                    pass
-
-        self._state = DealerState.STOPPED
-        self._logger.info("%s 已停止", self._service_id)
-
-    # ---------------- 连接 & 注册 ----------------
     def _connect_and_register(self):
         """(Re)connect to Router 并发送 register 消息"""
         # 1) 关闭旧连接
@@ -267,7 +279,36 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             except Exception as e:
                 self._logger.error(f"<{self._service_id}> CURVE 配置失败: {e}", exc_info=True)
 
+        self._logger.info(f"<{self._service_id}> Attempting to connect to {self._router_address}...")
         sock.connect(self._router_address)
+
+        # === 加入 Poller 来限制连接等待时间 ===
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLOUT) # 等待 socket 变为可写
+        connect_timeout_ms = 2000 # 设置连接超时，例如 2000ms = 2秒
+
+        try:
+            events = dict(poller.poll(connect_timeout_ms))
+            if sock in events and events[sock] == zmq.POLLOUT:
+                self._logger.info(f"<{self._service_id}> Connection seemingly established within {connect_timeout_ms}ms timeout.")
+            else:
+                # 连接超时
+                poller.unregister(sock) # 先取消注册
+                sock.close(linger=0)    # 关闭 socket
+                raise TimeoutError(f"Connection to {self._router_address} timed out after {connect_timeout_ms}ms")
+        except Exception as e:
+             # 捕获原始异常（包括上面的TimeoutError）并确保清理
+             self._logger.error(f"<{self._service_id}> Error during connection polling/establishment: {e}")
+             try:
+                 poller.unregister(sock)
+                 sock.close(linger=0)
+             except Exception:
+                 pass # 忽略清理错误
+             raise # 重新抛出原始异常
+        finally:
+            # 确保 Poller 被清理
+            poller.unregister(sock)
+        # === 连接超时检查结束 ===
 
         # 3) 构建 register payload
         remote_addr = self._remote_addr
@@ -298,13 +339,22 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         with self._socket_lock:
             try:
                 sock.send_multipart([b"register", json.dumps(service_info).encode()])
+                self._logger.info(f"<{self._service_id}> Register message sent.")
+            except zmq.Again:
+                sock.close(linger=0) # 关闭 socket 如果发送超时
+                raise TimeoutError(f"Sending register message timed out for {self._service_id}")
             except Exception as e:
                 self._logger.error(f"<{self._service_id}> 发送注册请求失败: {e}", exc_info=True)
+                # 发送失败也需要关闭 socket
+                try: sock.close(linger=0)
+                except: pass
+                raise # 重新抛出异常
 
         # 5) 更新实例状态
         self._socket = sock
         self._last_hb = time.time()
         self._diagnostics["connection_history"].append(self._last_hb)
+        self._logger.info(f"<{self._service_id}> _connect_and_register completed successfully.")
 
     # ---------------- 消息循环 ----------------
     def _message_loop(self):
@@ -553,17 +603,21 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             backoff = min(3600, 5 * (2 ** min(10, self._consecutive_reconnects - 1)))
             self._reconnect_protected_until = now + backoff
             self._logger.info(f"<{self._service_id}> 重连 #{self._consecutive_reconnects}，保护期 {backoff}s")
+
+            reconnect_success = False # 标记重连是否成功
             try:
-                # 先取得 socket_lock，防止重连期间其他线程访问 socket
                 with self._socket_lock:
-                    self._state = DealerState.RECONNECTING
-                    # 尝试重新连接并注册
+                    # 尝试重新连接并注册（此方法内部已更新 self._socket）
                     self._connect_and_register()
-                    self._socket = sock
-                
-                # 清晰标记重连已经完成
-                self._logger.info(f"<{self._service_id}> 重连完成")
+                reconnect_success = True # 如果没有异常，则标记成功
             except Exception as e:
                 self._logger.error(f"<{self._service_id}> 重连过程异常: {e}", exc_info=True)
+                reconnect_success = False # 标记失败
             finally:
-                self._state = DealerState.RUNNING
+                # 仅在重连成功且当前状态仍是RECONNECTING时，才改回RUNNING
+                if reconnect_success and self._state == DealerState.RECONNECTING:
+                    self._state = DealerState.RUNNING
+                    self._logger.info(f"<{self._service_id}> 重连成功，状态恢复为 RUNNING")
+                elif not reconnect_success and self._state == DealerState.RECONNECTING:
+                    self._logger.warning(f"<{self._service_id}> 重连失败，状态保持为 RECONNECTING")
+                # 如果状态被外部改变（如 STOPPING），则不修改
