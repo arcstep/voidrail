@@ -104,7 +104,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         group: Optional[str] = None,
         service_name: Optional[str] = None,
         heartbeat_interval: float = 1.0,
-        logger_level: int = logging.INFO,
+        logger: logging.Logger = None,
         api_key: Optional[str] = None,
         curve_server_key: Optional[bytes] = None,
         disable_reconnect: bool = False,
@@ -114,11 +114,13 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         # ---------------- 基本属性 ----------------
         self._router_address = router_address
         self._hwm            = hwm
-        self._logger         = logging.getLogger(__name__)
-        self._logger.setLevel(logger_level)
+        self._logger         = logger or logging.getLogger(__name__)
         self._service_name   = service_name or self.__class__.__name__
         self._group          = group or self._service_name
-
+        
+        # 重要：先设置 service_id，确保日志中使用
+        self._service_id  = f"{self._service_name}-{uuid.uuid4().hex[:8]}"
+        
         # --------------- 心跳与超时参数 ----------------
         I      = heartbeat_interval         # 用户配置的心跳间隔
         T_idle = I + 3.0                    # 空闲超时
@@ -161,13 +163,25 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
         }
 
         # --------------- 安全凭证 -------------------
-        self._api_key           = api_key or os.environ.get("VOIDRAIL_API_KEY")
-        self._curve_server_key  = curve_server_key or os.environ.get("VOIDRAIL_CURVE_SERVER_KEY", None)
+        self._api_key = api_key or os.environ.get("VOIDRAIL_API_KEY")
+        if curve_server_key:
+            self._curve_server_key = curve_server_key
+        else:
+            # 从环境变量读取时需要转换为字节
+            curve_key_hex = os.environ.get("VOIDRAIL_CURVE_SERVER_KEY")
+            if curve_key_hex:
+                try:
+                    self._curve_server_key = bytes.fromhex(curve_key_hex)
+                    self._logger.info(f"<{self._service_id}> 从环境变量加载了CURVE服务器公钥")
+                except ValueError:
+                    self._logger.error(f"<{self._service_id}> 无效的服务器公钥格式，应为十六进制字符串")
+            else:
+                self._curve_server_key = None
 
         # --------------- ZMQ & 线程池 ----------------
         self._ctx         = zmq.Context()   # 同步 Context
         self._socket      = None
-        self._socket_lock= threading.Lock() # 保护 send/recv
+        self._socket_lock = threading.RLock()  # 保护 send/recv，使用可重入锁避免死锁
         self._executor     = ThreadPoolExecutor(max_workers=max_workers)
         # 追踪未完成的请求 futures
         self._futures       = set()
@@ -175,9 +189,6 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
 
         # --------------- 停止/重连标志 --------------
         self._stop_event  = threading.Event()
-
-        # --------------- 唯一实例 ID ----------------
-        self._service_id  = f"{self._service_name}-{uuid.uuid4().hex[:8]}"
 
         # 预解析本机地址，避免重连时因 socket.gethostbyname 阻塞
         try:
@@ -367,7 +378,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
 
             # 5) 更新实例状态
             self._socket = sock
-            self._last_hb = time.time()
+            self._last_successful_heartbeat = time.time()
             
             # 重要：立即发送一次心跳，确保ROUTER能尽快识别服务
             try:
@@ -375,7 +386,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
             except Exception as e:
                 self._logger.warning(f"<{self._service_id}> 重连后初始心跳发送失败: {e}")
             
-            self._diagnostics["connection_history"].append(self._last_hb)
+            self._diagnostics["connection_history"].append(self._last_successful_heartbeat)
             self._logger.info(f"<{self._service_id}> _connect_and_register completed successfully.")
 
     def _send_heartbeat_internal(self, sock):
@@ -427,7 +438,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
     def _dispatch(self, parts):
         """根据消息类型分发，同时更新心跳与诊断统计"""
         now = time.time()
-        self._last_hb = now
+        self._last_successful_heartbeat = now
         # 统计接收消息次数并记录心跳历史
         self._diagnostics["received_messages"] += 1
         self._heartbeat_history.append({
@@ -650,7 +661,7 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                 now = time.time()
                 timeout = (self._busy_heartbeat_timeout if self._is_busy()
                            else self._idle_heartbeat_timeout)
-                if now - self._last_hb > timeout * 0.8 and not self._disable_reconnect:
+                if now - self._last_successful_heartbeat > timeout * 0.8 and not self._disable_reconnect:
                     self._trigger_reconnect()
             except Exception as e:
                 self._logger.error(f"<{self._service_id}> 重连监控异常: {e}", exc_info=True)
