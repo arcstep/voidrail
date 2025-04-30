@@ -47,8 +47,7 @@ async def both_auth_router(router_address, auth_keys):
         router_address,
         heartbeat_interval=0.5,
         dealer_api_keys=[auth_keys["dealer_key"]],
-        client_api_keys=[auth_keys["client_key"]],
-        logger_level=logging.DEBUG
+        client_api_keys=[auth_keys["client_key"]]
     )
     await router.start()
     yield router
@@ -60,8 +59,7 @@ async def only_client_auth_router(router_address, auth_keys):
     router = ServiceRouter(
         router_address,
         heartbeat_interval=0.5,
-        client_api_keys=[auth_keys["client_key"]],
-        logger_level=logging.DEBUG
+        client_api_keys=[auth_keys["client_key"]]
     )
     await router.start()
     yield router
@@ -73,8 +71,7 @@ async def only_dealer_auth_router(router_address, auth_keys):
     router = ServiceRouter(
         router_address,
         heartbeat_interval=0.5,
-        dealer_api_keys=[auth_keys["dealer_key"]],
-        logger_level=logging.DEBUG
+        dealer_api_keys=[auth_keys["dealer_key"]]
     )
     await router.start()
     yield router
@@ -85,8 +82,7 @@ async def no_auth_router(router_address):
     """创建并启动不需要认证的路由器 (DEBUG log)"""
     router = ServiceRouter(
         router_address, 
-        heartbeat_interval=0.5,
-        logger_level=logging.DEBUG
+        heartbeat_interval=0.5
     )
     await router.start()
     yield router
@@ -101,7 +97,6 @@ class AuthTestService(ServiceDealer):
                 **kwargs):
         self.service_name = f"AuthTestService-{service_id_suffix}-{uuid.uuid4().hex[:4]}"
 
-        kwargs.setdefault('logger_level', logging.DEBUG)
         kwargs.setdefault('heartbeat_interval', 0.1)
 
         super().__init__(
@@ -124,8 +119,7 @@ async def valid_client(router_address, auth_keys):
     client = ClientDealer(
         router_address, 
         timeout=2.0,
-        api_key=auth_keys["client_key"],
-        logger_level=logging.DEBUG
+        api_key=auth_keys["client_key"]
     )
     yield client
     await client.close()
@@ -136,8 +130,7 @@ async def invalid_client(router_address, auth_keys):
     client = ClientDealer(
         router_address, 
         timeout=1.0,
-        api_key=auth_keys["invalid_key"],
-        logger_level=logging.DEBUG
+        api_key=auth_keys["invalid_key"]
     )
     yield client
     await client.close()
@@ -147,8 +140,7 @@ async def no_key_client(router_address):
     """创建无认证密钥的客户端 (DEBUG log)"""
     client = ClientDealer(
         router_address, 
-        timeout=1.0,
-        logger_level=logging.DEBUG
+        timeout=1.0
     )
     yield client
     await client.close()
@@ -228,7 +220,7 @@ async def test_no_auth_router_allows_all(no_auth_router, router_address, no_key_
         assert resp[0] == msg
 
         with pytest.raises(RuntimeError) as exc_info_invalid:
-            client = ClientDealer(router_address, api_key=auth_keys['client_key'], logger_level=logging.DEBUG)
+            client = ClientDealer(router_address, api_key=auth_keys['client_key'])
             await client.connect()
         assert "no need to authenticate" in str(exc_info_invalid.value).lower()
 

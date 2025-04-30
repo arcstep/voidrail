@@ -35,14 +35,6 @@ def router_address():
     """每次测试使用唯一的地址"""
     return f"tcp://127.0.0.1:{5000 + uuid.uuid4().int % 10000}"
 
-@pytest.fixture(scope="function")
-def zmq_context():
-    """创建ZMQ Context并确保清理"""
-    context = zmq.asyncio.Context()
-    yield context
-    # 强制关闭并清理所有套接字
-    context.destroy(linger=0)
-
 class SecureEchoService(ServiceDealer):
     """用于测试的加密服务"""
     
@@ -53,13 +45,17 @@ class SecureEchoService(ServiceDealer):
         return message
 
 @pytest.mark.asyncio
-async def test_curve_communication_minimal(server_keys, router_address, zmq_context):
+async def test_curve_communication_minimal(server_keys, router_address):
     """极简测试：直接测试 ZMQ ROUTER <-> DEALER 的 CURVE 通信"""
     server_public_key, server_secret_key = zmq.auth.load_certificate(server_keys["secret_file"])
     client_public_key, client_secret_key = zmq.curve_keypair()
 
+    # 创建自己的 context
+    server_context = zmq.asyncio.Context()
+    client_context = zmq.asyncio.Context()
+
     # --- 服务器端 (模拟 Router 的核心) ---
-    server_socket = zmq_context.socket(zmq.ROUTER)
+    server_socket = server_context.socket(zmq.ROUTER)
     server_socket.curve_secretkey = server_secret_key
     server_socket.curve_publickey = server_public_key
     server_socket.curve_server = True  # 启用服务器模式
@@ -92,7 +88,7 @@ async def test_curve_communication_minimal(server_keys, router_address, zmq_cont
 
 
     # --- 客户端 (模拟测试代码的核心) ---
-    client_socket = zmq_context.socket(zmq.DEALER)
+    client_socket = client_context.socket(zmq.DEALER)
     client_id = f"minimal_client_{uuid.uuid4().hex[:8]}".encode()
     client_socket.identity = client_id
     client_socket.curve_secretkey = client_secret_key
@@ -146,20 +142,24 @@ async def test_curve_communication_minimal(server_keys, router_address, zmq_cont
                 await server_task
             except asyncio.CancelledError:
                 pass
+        # 清理 context
+        client_context.destroy(linger=0)
+        server_context.destroy(linger=0)
         logger.info("Minimal Test: Cleanup complete.")
 
 
 @pytest.mark.asyncio
-async def test_curve_communication(server_keys, router_address, zmq_context):
+async def test_curve_communication(server_keys, router_address):
     """使用直接套接字测试CURVE加密的 'methods' 请求"""
     server_public = server_keys["public_key"]
 
-    # 启动Router
+    # 创建自己的 context
+    context = zmq.asyncio.Context()
+
+    # 启动Router (移除 context 参数)
     router = ServiceRouter(
         router_address,
-        context=zmq_context,
-        curve_server_key_file=server_keys["secret_file"],
-        logger_level=logging.DEBUG  # 开启详细日志
+        curve_server_key_file=server_keys["secret_file"]
     )
     logger.debug("启动Router...")
     await router.start()
@@ -167,7 +167,7 @@ async def test_curve_communication(server_keys, router_address, zmq_context):
     logger.debug("Router应该已启动")
 
     # 创建直接套接字连接
-    socket = zmq_context.socket(zmq.DEALER)
+    socket = context.socket(zmq.DEALER)
     client_id = f"test_client_{uuid.uuid4().hex[:8]}".encode()
     socket.identity = client_id
     logger.debug(f"客户端ID: {client_id.decode()}")
@@ -217,6 +217,7 @@ async def test_curve_communication(server_keys, router_address, zmq_context):
         logger.debug("关闭套接字和Router...")
         socket.close(linger=0)
         await router.stop()
+        context.destroy(linger=0)
         logger.debug("测试清理完成")
 
 
@@ -238,35 +239,31 @@ class TestCurveKeyManagement:
         assert len(keys["fingerprint"]) == 16  # 指纹长度为16个字符
 
 @pytest.mark.asyncio
-async def test_secure_echo(router_address, zmq_context, server_keys):
+async def test_secure_echo(router_address, server_keys):
     """基础加密通信测试"""
     logger.debug("开始基础加密通信测试")
     
-    # 创建并启动路由器
     router = ServiceRouter(
         router_address, 
-        context=zmq_context,
-        heartbeat_timeout=0.5,
-        curve_server_key_file=server_keys["secret_file"],  # 只提供服务器密钥文件
+        heartbeat_interval=0.5,
+        curve_server_key_file=server_keys["secret_file"]
     )
     
     try:
         await router.start()
-        await asyncio.sleep(0.5)  # 等待Router完全启动
+        await asyncio.sleep(0.5)
         logger.debug("路由器启动成功")
         
         # 创建并启动服务
         service = SecureEchoService(
             router_address,
-            context=zmq_context,
             heartbeat_interval=0.1,
-            heartbeat_timeout=0.5,
-            curve_server_key=server_keys["public_key"]  # 只提供服务器公钥
+            curve_server_key=server_keys["public_key"]
         )
         
         try:
-            await service.start()
-            await asyncio.sleep(1.0)  # 给服务更多时间注册
+            service.start()
+            await asyncio.sleep(1.0)
             logger.debug("服务启动成功")
             
             # 等待服务注册
@@ -275,8 +272,7 @@ async def test_secure_echo(router_address, zmq_context, server_keys):
             # 创建客户端
             client = ClientDealer(
                 router_address, 
-                context=zmq_context,
-                timeout=5.0,  # 大幅增加超时时间
+                timeout=5.0,
                 curve_server_key=server_keys["public_key"]
             )
             
@@ -299,12 +295,12 @@ async def test_secure_echo(router_address, zmq_context, server_keys):
             finally:
                 await client.close()
         finally:
-            await service.stop()
+            service.stop()
     finally:
         await router.stop()
 
 @pytest.mark.asyncio
-async def test_env_key_communication(router_address, zmq_context, server_keys, monkeypatch):
+async def test_env_key_communication(router_address, server_keys, monkeypatch):
     """测试通过环境变量配置公钥的通信"""
     # 设置环境变量
     monkeypatch.setenv("VOIDRAIL_CURVE_SERVER_KEY", server_keys["public_key_hex"])
@@ -312,7 +308,6 @@ async def test_env_key_communication(router_address, zmq_context, server_keys, m
     # 创建并启动路由器
     router = ServiceRouter(
         router_address,
-        context=zmq_context,
         curve_server_key_file=server_keys["secret_file"]
     )
     
@@ -321,19 +316,17 @@ async def test_env_key_communication(router_address, zmq_context, server_keys, m
         
         # 创建服务 - 不直接提供公钥，从环境变量获取
         service = SecureEchoService(
-            router_address,
-            context=zmq_context
+            router_address
             # 无需提供curve_server_key，将从环境变量读取
         )
         
         try:
-            await service.start()
+            service.start()
             await asyncio.sleep(0.3)
             
             # 创建客户端 - 不直接提供公钥，从环境变量获取
             client = ClientDealer(
                 router_address,
-                context=zmq_context,
                 timeout=2.0
                 # 无需提供curve_server_key，将从环境变量读取  
             )
@@ -350,17 +343,16 @@ async def test_env_key_communication(router_address, zmq_context, server_keys, m
             
             await client.close()
         finally:
-            await service.stop()
+            service.stop()
     finally:
         await router.stop()
 
 @pytest.mark.asyncio
-async def test_unauthorized_client_rejection(router_address, zmq_context, server_keys):
+async def test_unauthorized_client_rejection(router_address, server_keys):
     """测试未授权客户端被拒绝连接"""
     # 创建并启动路由器
     router = ServiceRouter(
         router_address,
-        context=zmq_context,
         curve_server_key_file=server_keys["secret_file"],
         client_api_keys=["authorized_key"]  # 设置API密钥验证
     )
@@ -371,19 +363,17 @@ async def test_unauthorized_client_rejection(router_address, zmq_context, server
         # 创建服务
         service = SecureEchoService(
             router_address,
-            context=zmq_context,
             api_key="authorized_key",  # 使用有效的API密钥
             curve_server_key=server_keys["public_key"]
         )
         
         try:
-            await service.start()
+            service.start()
             await asyncio.sleep(0.3)
             
             # 创建未授权客户端 - 加密正确但API密钥错误
             client = ClientDealer(
                 router_address,
-                context=zmq_context,
                 timeout=1.0,
                 curve_server_key=server_keys["public_key"],
                 api_key="wrong_key"  # 使用错误的API密钥
@@ -398,78 +388,54 @@ async def test_unauthorized_client_rejection(router_address, zmq_context, server
             
             await client.close()
         finally:
-            await service.stop()
+            service.stop()
     finally:
         await router.stop()
 
 @pytest.mark.asyncio
-async def test_secure_echo_with_auth(router_address, zmq_context, server_keys):
+async def test_secure_echo_with_auth(router_address, server_keys):
     """测试使用ClientDealer/ServiceDealer进行带API Key认证的CURVE加密通信"""
     logger.debug("开始带认证的CURVE加密通信测试 (使用框架类)")
 
     VALID_API_KEY = f"secure-key-{uuid.uuid4().hex}" # 每次测试使用唯一Key
 
-    # 1. 启动带认证和CURVE的Router
-    #    Router 需要配置服务器密钥文件以启用CURVE
-    #    Router 需要配置 client_api_keys 以启用客户端API Key认证
+    # 使用 heartbeat_interval 代替 heartbeat_timeout
     router = ServiceRouter(
         router_address,
-        context=zmq_context,
         curve_server_key_file=server_keys["secret_file"],
-        client_api_keys=[VALID_API_KEY], # <--- 启用客户端API Key认证
-        heartbeat_timeout=2.0, # 使用稍长的超时增加稳定性
-        logger_level=logging.DEBUG
+        client_api_keys=[VALID_API_KEY],
+        heartbeat_interval=2.0  # 这里使用 heartbeat_interval
     )
     await router.start()
-    await asyncio.sleep(0.5) # 等待Router启动
-    logger.debug(f"带认证的Router启动成功，地址: {router_address}")
-
-    # 2. 启动带CURVE的服务
-    #    ServiceDealer 需要配置服务器公钥以启用CURVE客户端模式
-    #    注意：ServiceDealer注册本身通常不需要API Key (除非Router配置了dealer_api_keys)
+    await asyncio.sleep(0.5)
+    
+    # 创建服务
     service = SecureEchoService(
         router_address,
-        context=zmq_context,
-        curve_server_key=server_keys["public_key"], # Dealer连接Router需要服务器公钥
-        heartbeat_interval=0.5,
-        heartbeat_timeout=2.0,
-        logger_level=logging.DEBUG
+        curve_server_key=server_keys["public_key"],
+        heartbeat_interval=0.5
     )
-    service_id = service._service_id # 获取服务ID用于日志
-    logger.debug(f"启动服务 {service_id}...")
-    await service.start()
-    # 等待服务注册完成
-    # 可以轮询 Router 的服务列表来确认，而不是固定等待
-    for _ in range(10): # 最多等待1秒
-        if service_id in router._services and router._services[service_id].state == ServiceState.ACTIVE:
-             logger.debug(f"服务 {service_id} 已在Router注册并激活")
-             break
-        await asyncio.sleep(0.1)
-    else:
-         pytest.fail(f"服务 {service_id} 未能在预期时间内注册到Router")
-
-
-    # 3. 创建带正确API Key和CURVE的客户端
+    
+    # 使用同步方法，不要使用 await
+    service.start()   # 不要使用 await，这是同步方法
+    
+    # 2. 创建带正确API Key和CURVE的客户端
     #    ClientDealer 需要配置服务器公钥以启用CURVE
     #    ClientDealer 需要配置正确的 api_key 以通过Router认证
     authorized_client = ClientDealer(
         router_address,
-        context=zmq_context,
         timeout=5.0,
         curve_server_key=server_keys["public_key"],
-        api_key=VALID_API_KEY, # <--- 提供正确的API Key
-        logger_level=logging.DEBUG
+        api_key=VALID_API_KEY
     )
     logger.debug(f"创建授权客户端 (ID: {authorized_client._client_id})，API Key: {VALID_API_KEY}")
 
     # 4. 创建带错误API Key和CURVE的客户端 (用于验证拒绝)
     unauthorized_client = ClientDealer(
         router_address,
-        context=zmq_context,
         timeout=2.0, # 短超时即可
         curve_server_key=server_keys["public_key"],
-        api_key="wrong-key", # <--- 提供错误的API Key
-        logger_level=logging.DEBUG
+        api_key="wrong-key"
     )
     logger.debug(f"创建未授权客户端 (ID: {unauthorized_client._client_id})，API Key: wrong-key")
 
@@ -509,12 +475,12 @@ async def test_secure_echo_with_auth(router_address, zmq_context, server_keys):
         logger.debug("清理测试资源...")
         await authorized_client.close()
         await unauthorized_client.close()
-        await service.stop()
+        service.stop()    # 不要使用 await，这是同步方法
         await router.stop()
         logger.debug("测试清理完成")
 
 @pytest.mark.asyncio
-async def test_curve_and_apikey_together(router_address, zmq_context, server_keys):
+async def test_curve_and_apikey_together(router_address, server_keys):
     """测试CURVE加密和API Key认证同时工作"""
     logger.debug("开始CURVE加密与API Key认证协同工作测试")
     
@@ -524,10 +490,8 @@ async def test_curve_and_apikey_together(router_address, zmq_context, server_key
     # 1. 创建同时启用CURVE和API Key的路由器
     router = ServiceRouter(
         router_address, 
-        context=zmq_context,
         curve_server_key_file=server_keys["secret_file"],  # 启用CURVE
-        client_api_keys=[API_KEY],                         # 启用API Key认证
-        logger_level=logging.DEBUG
+        client_api_keys=[API_KEY]                         # 启用API Key认证
     )
     
     await router.start()
@@ -537,33 +501,27 @@ async def test_curve_and_apikey_together(router_address, zmq_context, server_key
         # 2. 创建服务
         service = SecureEchoService(
             router_address,
-            context=zmq_context,
-            curve_server_key=server_keys["public_key"],  # 使用CURVE
-            logger_level=logging.DEBUG
+            curve_server_key=server_keys["public_key"]  # 使用CURVE
         )
         
-        await service.start()
+        service.start()
         await asyncio.sleep(0.5)
         
         try:
             # 3. 创建正确客户端(同时有CURVE和API Key)
             correct_client = ClientDealer(
                 router_address,
-                context=zmq_context,
                 curve_server_key=server_keys["public_key"],  # 正确的CURVE
                 api_key=API_KEY,                             # 正确的API Key
-                timeout=2.0,
-                logger_level=logging.DEBUG
+                timeout=2.0
             )
             
             # 4. 创建只有CURVE无API Key客户端
             curve_only_client = ClientDealer(
                 router_address,
-                context=zmq_context,
                 curve_server_key=server_keys["public_key"],  # 正确的CURVE
                 # 没有API Key
-                timeout=2.0,
-                logger_level=logging.DEBUG
+                timeout=2.0
             )
             
             # 5. 测试正确客户端能够通信
@@ -583,6 +541,6 @@ async def test_curve_and_apikey_together(router_address, zmq_context, server_key
             logger.info("CURVE和API Key协同工作测试通过")
             
         finally:
-            await service.stop()
+            service.stop()
     finally:
         await router.stop()

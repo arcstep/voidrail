@@ -63,23 +63,21 @@ class ServiceRouter:
     def __init__(
         self, 
         address: str, 
-        context: Optional[zmq.asyncio.Context] = None,
         heartbeat_interval: float = 1.0,  # 用户唯一需配置的心跳"检查"周期
         hwm: int = 1000,
         dealer_api_keys: List[str] = None,     # DEALER 端 API 密钥列表
         client_api_keys: List[str] = None,     # CLIENT 端 API 密钥列表
         curve_server_key_file: str = None,  # 保留此参数
-        logger_level: int = logging.INFO,
+        logger: logging.Logger = None,
     ):
-        self._context = context or zmq.asyncio.Context()
+        self._context = zmq.asyncio.Context()
         self._address = address
         self._socket = self._context.socket(zmq.ROUTER)
         self._socket.set_hwm(hwm)  # 设置高水位标记
         self._socket.bind(self._address)
         self._running = False
         self._services: Dict[str, ServiceInfo] = {}
-        self._logger = logging.getLogger(__name__)
-        self._logger.setLevel(logger_level)
+        self._logger = logger or logging.getLogger(__name__)
         
         # 基准心跳检查周期
         I = heartbeat_interval

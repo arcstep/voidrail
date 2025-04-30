@@ -13,17 +13,15 @@ class ClientDealer:
     def __init__(
         self,
         router_address: str,
-        context: Optional[zmq.asyncio.Context] = None,
         timeout: Optional[float] = None,
         api_key: Optional[str] = None,
         curve_server_key: bytes = None,  # 仅凭此参数判断是否启用加密
-        logger_level: int = logging.INFO,
+        logger: logging.Logger = None,
     ):
         self._router_address = router_address
         self._timeout = timeout
-        self._logger = logging.getLogger(__name__)
-        self._logger.setLevel(logger_level)
-        self._context = context or zmq.asyncio.Context.instance()
+        self._logger = logger or logging.getLogger(__name__)
+        self._context = zmq.asyncio.Context()
         self._socket = None
         self._lock = asyncio.Lock()
         self._connected = False

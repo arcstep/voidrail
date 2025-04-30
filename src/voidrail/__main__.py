@@ -43,6 +43,7 @@ def router(host, port, mode, heartbeat, dealer_keys, client_keys, logger_level):
     logging.basicConfig(level=level, format=_LOG_FORMAT, force=True)
     # 3) 也单独设置 voidrail.router 的日志
     logging.getLogger("voidrail").setLevel(level)
+    logger = logging.getLogger("voidrail")
     
     async def start_router():
         router = ServiceRouter(
@@ -50,7 +51,7 @@ def router(host, port, mode, heartbeat, dealer_keys, client_keys, logger_level):
             heartbeat_interval=heartbeat,
             dealer_api_keys=list(dealer_keys) or None,
             client_api_keys=list(client_keys) or None,
-            logger_level=level
+            logger=logger
         )
         await router.start()
         click.echo(f"Router 已启动: {address}") 
@@ -113,9 +114,10 @@ def client(host, port, list, router_info, queue_status, call, args, timeout, api
     level = getattr(logging, logger_level.upper(), logging.INFO)
     logging.basicConfig(level=level, format=_LOG_FORMAT, force=True)
     logging.getLogger("voidrail").setLevel(level)
+    logger = logging.getLogger("voidrail")
     
     async def run_client():
-        client = ClientDealer(router_address=address, timeout=timeout, api_key=api_key, logger_level=level)
+        client = ClientDealer(router_address=address, timeout=timeout, api_key=api_key, logger=logger)
         try:
             await client.connect()
             click.echo(f"已连接到Router: {address}")
@@ -281,7 +283,8 @@ def dealer(host, port, module, class_names, heartbeat, api_key, logger_level):
     level = getattr(logging, logger_level.upper(), logging.INFO)
     logging.basicConfig(level=level, format=_LOG_FORMAT, force=True)
     logging.getLogger("voidrail").setLevel(level)
-    
+    logger = logging.getLogger("voidrail")
+
     try:
         # 动态导入模块和类
         sys.path.insert(0, str(Path.cwd()))
@@ -333,7 +336,7 @@ def dealer(host, port, module, class_names, heartbeat, api_key, logger_level):
             router_address=address,
             heartbeat_interval=heartbeat,
             api_key=api_key,
-            logger_level=level
+            logger=logger
         )
         click.echo(f"启动 Dealer 服务: {class_name}")
 
