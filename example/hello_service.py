@@ -1,7 +1,7 @@
 import sys
 import os
 import time
-from voidrail.worker import CeleryWorker
+from voidrail import task, CeleryWorker
 
 class HelloService(CeleryWorker):
     """示例服务，提供简单的问候功能"""
@@ -11,12 +11,12 @@ class HelloService(CeleryWorker):
         super().__init__(service_name="hello")
         
         # 注册任务
-        @self.celery_app.task(name='hello.say_hello')
+        @task(name='hello.say_hello')
         def say_hello(name):
             """简单的问候任务"""
             return f"Hello, {name}! Current time: {time.ctime()}"
         
-        @self.celery_app.task(name='hello.say_hello_delay', bind=True)
+        @task(name='hello.say_hello_delay', bind=True)
         def say_hello_delay(self, name, delay=3):
             """带延迟的问候任务，演示任务状态更新"""
             self.update_state(state='PROGRESS', meta={'progress': 0, 'message': '开始处理'})

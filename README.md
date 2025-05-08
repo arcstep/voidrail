@@ -2,9 +2,7 @@
 
 VoidRail 的名称来自于古老的修仙界，是虚空传送阵的意思。
 
-VoidRail 是一个基于 ZeroMQ 的轻量级微服务通信框架，采用 ROUTER-DEALER 模式实现服务发现和高可用性。它使用纯 JSON 作为数据交换格式，非常容易在分布式环境中部署和扩展。
-
-VoidRail 的主要目标是实现 **CPU 密集型计算的分布式部署**，通过启动多个 DEALER 服务实例来实现并发控制，充分利用多核心和多机器资源。如果你需要进行 IO 密集型的应用开发，建议使用 FastAPI 等更适合的框架。
+VoidRail 基于 Celery 构建轻量级分布式任务处理框架，专为 CPU 密集型计算设计。它提供简单易用的接口，让您可以快速构建和部署分布式计算服务。
 
 ## 安装
 
@@ -14,186 +12,243 @@ VoidRail 的主要目标是实现 **CPU 密集型计算的分布式部署**，�
 pip install voidrail
 ```
 
-或使用 poetry 安装：
-
-```bash
-poetry add voidrail
-```
-
 ## 核心组件
 
-VoidRail 采用三组件架构：
+VoidRail 采用两组件架构：
 
-1. **ROUTER**：中央路由服务，通常通过命令行启动
-2. **DEALER**：服务实现模块，需要自定义实现处理逻辑，可通过命令行启动多个实例
-3. **CLIENT**：客户端模块，在宿主代码中使用，用于发送请求
+1. **Worker**：服务实现模块，继承 `CeleryWorker` 基类，定义处理逻辑
+2. **Client**：客户端模块，使用 `CeleryClient` 类发送任务请求
 
-这种组织方式基于 ZMQ 的核心概念，特别适合 CPU 密集型计算任务的分布式处理。
+## 基本使用
 
-### 工作流程
+### 创建服务
 
-```
-ClientDealer --请求--> ServiceRouter --转发--> ServiceDealer
-            <--响应-- ServiceRouter <--返回--
-```
-
-## 特性
-
-- 使用 FIFO (先进先出) 模式分发请求，确保请求按顺序处理，适合 CPU 密集型计算
-- 支持自动服务发现和注册（方便运维时手动下线或上线 DEALER 服务）
-- 支持服务监控、健康检查和心跳机制
-- 支持同步/异步方法和流式响应
-- 使用 JSON 做数据交换
-- 支持 API 密钥认证，提升服务安全性
-
-## 快速入门
-
-### 1. 创建自定义 DEALER 服务
-
-首先创建一个 Python 模块，例如 `my_service.py`：
+创建一个 Python 模块，例如 `hello_service.py`：
 
 ```python
-from voidrail import ServiceDealer, service_method
+from voidrail import CeleryWorker, task
 
-class SimpleService(ServiceDealer):
+class HelloService(CeleryWorker):
     """简单的示例服务"""
     
-    @service_method
-    def echo(self, message):
-        """简单的回显服务"""
-        return f"收到消息: {message}"
-    
-    @service_method
-    def add(self, a, b):
-        """简单的加法服务"""
-        return a + b
+    def __init__(self):
+        # 初始化父类
+        super().__init__(service_name="hello")
+        
+        # 注册任务
+        @task(name='hello.say_hello')
+        def say_hello(name):
+            """简单的问候任务"""
+            return f"Hello, {name}!"
+        
+        @task(name='hello.say_hello_delay', bind=True)
+        def say_hello_delay(self, name, delay=3):
+            """带进度更新的任务"""
+            self.update_state(state='PROGRESS', meta={'progress': 0})
+            # 处理逻辑...
+            return f"Hello after delay, {name}!"
+
+if __name__ == "__main__":
+    service = HelloService()
+    service.start_worker()
 ```
 
-### 2. 使用命令行启动 ROUTER 和 DEALER
-
-启动 ROUTER 服务（在一个终端中）：
-
-```bash
-voidrail router --host 0.0.0.0 --port 5555
-```
-
-启动多个 DEALER 服务实例（在另一个终端中）：
-
-```bash
-# 自动启动4个服务实例，充分利用多核 CPU
-voidrail dealer --module my_service --class SimpleService --instances 4
-```
-
-### 3. 在应用中使用 CLIENT
-
-在你的主应用中：
+### 使用客户端
 
 ```python
-import asyncio
-from voidrail import ClientDealer
+from voidrail import CeleryClient
 
-async def main():
-    # 创建客户端连接
-    client = ClientDealer(router_address="tcp://localhost:5555")
-    
-    # 调用回显服务
-    result1 = await client.invoke("SimpleService.echo", "你好，世界！")
-    print(result1)  # 输出: 收到消息: 你好，世界！
-    
-    # 调用加法服务
-    result2 = await client.invoke("SimpleService.add", 40, 2)
-    print(result2)  # 输出: 42
-    
-    await client.close()
+# 创建客户端
+client = CeleryClient(service_name="hello")
 
-# 运行主函数
-asyncio.run(main())
+# 同步调用
+result = client.call(
+    task_name="say_hello",
+    args=["World"],
+    wait_result=True
+)
+print(result["result"])  # 输出: Hello, World!
+
+# 异步调用
+async_result = client.call(
+    task_name="say_hello_delay",
+    args=["Async World"],
+    kwargs={"delay": 2},
+    wait_result=False
+)
+task_id = async_result["task_id"]
+
+# 检查任务状态
+status = client.get_task_status(task_id)
 ```
 
-## 使用场景
+## 高级用例
 
-VoidRail 特别适合以下场景：
+### 在一个服务类中定义多个任务方法
 
-1. **AI 模型推理服务**：将大型 ML/DL 模型部署到多个 DEALER 实例，实现负载分散
-2. **数据处理管道**：对大规模数据执行 CPU/GPU 密集型处理
-3. **批量任务处理**：将需要长时间运行的任务分发到多个 DEALER 实例
+在同一个 `CeleryWorker` 子类中，您可以定义任意数量的任务方法：
 
-## 命令行工具详解
+```python
+class CalculationService(CeleryWorker):
+    def __init__(self):
+        super().__init__(service_name="calculator")
+        
+        @task(name='calculator.add')
+        def add(a, b):
+            return a + b
+            
+        @task(name='calculator.multiply')
+        def multiply(a, b):
+            return a * b
+            
+        @task(name='calculator.divide')
+        def divide(a, b):
+            return a / b
+```
 
-大部分情况下，推荐使用命令行工具来启动 ROUTER 和 DEALER 服务，然后在应用代码中使用 CLIENT。
+客户端调用：
 
-### 启动 ROUTER 服务
+```python
+calc_client = CeleryClient(service_name="calculator")
+result1 = calc_client.call("add", args=[10, 20])
+result2 = calc_client.call("multiply", args=[5, 6])
+```
+
+### 定义多个服务类
+
+您可以创建多个 `CeleryWorker` 子类，每个类负责一组相关功能：
+
+```python
+# 文本处理服务
+class TextService(CeleryWorker):
+    def __init__(self):
+        super().__init__(service_name="text")
+        
+        @task(name='text.uppercase')
+        def to_uppercase(text):
+            return text.upper()
+            
+# 图像处理服务
+class ImageService(CeleryWorker):
+    def __init__(self):
+        super().__init__(service_name="image")
+        
+        @task(name='image.resize')
+        def resize_image(image_data, width, height):
+            # 图像处理逻辑
+            return processed_image
+```
+
+### 多个服务共享同一个 Redis 队列
+
+多个不同的服务可以连接到同一个 Redis 队列，并各自处理自己的任务：
+
+```python
+# 服务A
+class ServiceA(CeleryWorker):
+    def __init__(self):
+        # 指定相同的 broker_url
+        super().__init__(
+            service_name="service_a",
+            broker_url="redis://localhost:6379/0"
+        )
+        
+        @task(name='service_a.task1')
+        def task1(data):
+            return f"ServiceA处理: {data}"
+
+# 服务B
+class ServiceB(CeleryWorker):
+    def __init__(self):
+        # 使用相同的 broker_url
+        super().__init__(
+            service_name="service_b",
+            broker_url="redis://localhost:6379/0"
+        )
+        
+        @task(name='service_b.task1')
+        def task1(data):
+            return f"ServiceB处理: {data}"
+```
+
+Celery 会基于任务名称将请求正确路由到相应的服务实例。客户端通过指定完整任务名称来调用特定服务：
+
+```python
+client = CeleryClient(
+    service_name="common_client",
+    broker_url="redis://localhost:6379/0"
+)
+
+# 调用服务A的任务
+result_a = client.call("service_a.task1", args=["测试数据"])
+
+# 调用服务B的任务
+result_b = client.call("service_b.task1", args=["测试数据"])
+```
+
+### 水平扩展能力
+
+VoidRail的一个主要优势是支持简单而强大的水平扩展。当您启动多个相同服务的Worker实例时：
+
+1. **自动负载均衡**：所有实例会自动协作处理队列中的任务
+2. **无需额外配置**：不需要任何特殊设置，只需启动更多相同的服务实例
+3. **容错和高可用**：如果某个实例崩溃，其他实例会继续处理任务
+
+例如，您可以在多台服务器上启动相同的服务：
+
+```mermaid
+graph TB
+    Client[客户端]
+    Queue[(Redis消息队列)]
+    
+    subgraph "服务器A"
+    Worker1[Worker实例1]
+    end
+    
+    subgraph "服务器B"
+    Worker2[Worker实例2]
+    Worker3[Worker实例3]
+    end
+    
+    subgraph "服务器C"
+    Worker4[Worker实例4]
+    end
+    
+    Client -->|发送任务| Queue -->|分发任务| Worker1 & Worker2 & Worker3 & Worker4
+```
+
+## 运行多个Worker实例
+
+要充分利用多核CPU，可以启动多个Worker实例：
 
 ```bash
-# 基本用法
-voidrail router --host 0.0.0.0 --port 5555
-
-# 启用 API 密钥认证
-voidrail router --dealer-keys dealer_key1 --client-keys client_key1
+# 启动Worker进程
+# 通过环境变量控制并发度
+CELERY_CONCURRENCY=4 python hello_service.py
 ```
 
-### 启动 DEALER 服务实例
+您可以在不同的服务器上多次启动相同的服务实例：
 
 ```bash
-# 启动单个实例
-voidrail dealer --module my_service --class SimpleService
+# 在服务器A上
+python hello_service.py
 
-# 使用 API 密钥认证
-voidrail dealer --api-key your_dealer_key --module my_service
+# 在服务器B上
+python hello_service.py
+
+# 在服务器C上
+python hello_service.py
 ```
 
-### 使用客户端命令行工具（调试用）
-
-```bash
-# 列出所有可用服务
-voidrail client --list
-
-# 查看路由器信息
-voidrail client --router-info
-
-# 调用服务方法（带参数）
-voidrail client --call SimpleService.echo --args '"你好，世界！"'
-```
-
-## 分布式部署
-
-VoidRail 特别适合分布式部署，可以将 DEALER 服务部署在多台机器上：
-
-1. **部署 ROUTER**：在中央服务器上部署 ROUTER，确保所有 DEALER 和 CLIENT 都能访问
-
-    ```bash
-    voidrail router --host 0.0.0.0 --port 5555
-    ```
-
-2. **部署多台 DEALER**：在不同机器上启动 DEALER 服务，连接到同一个 ROUTER
-
-    ```bash
-    # 在机器 A
-    voidrail dealer --host router_bus_ip --port 5555 --module my_service
-    
-    # 在机器 B
-    voidrail dealer --host router_bus_ip --port 5555 --module my_service
-    ```
-
-3. **客户端连接**：在应用中连接到中央 ROUTER
-
-    ```python
-    client = ClientDealer(router_address="tcp://router_bus_ip:5555")
-    ```
-
-## 安全建议
-
-VoidRail 提供了基本的安全机制：
-
-1. **API 密钥认证**：控制哪些 DEALER 和 CLIENT 能够连接到 ROUTER
-2. **CURVE 加密**：可选启用 ZMQ 的 CURVE 加密，保护传输中的数据
-
-在生产环境中，建议至少启用 API 密钥认证，并考虑将 ROUTER 放置在受保护的网络中。对于特别敏感的数据，可以启用 CURVE 加密提供更强的安全保障。
+每个实例都会自动加入相同的worker池，共同处理任务队列。Celery会为每个worker分配一个唯一ID，
+确保任务只会被处理一次。这种设计使VoidRail非常适合需要动态扩展的场景 - 随着负载增加，
+只需启动更多的worker实例即可线性提高处理能力。
 
 ## 最佳实践
 
-1. **合理设置实例数量**：DEALER 实例数通常应与可用 CPU 核心数匹配
-2. **注意资源管理**：确保每个 DEALER 实例有足够的内存和 CPU 资源
-3. **错误处理**：在 DEALER 方法中妥善处理异常，避免服务崩溃
-4. **监控**：定期检查队列状态和服务健康，及时发现并解决问题
-5. **合理拆分服务**：将不同类型的计算任务拆分为不同的 DEALER 服务类
+1. **任务颗粒度**：设计适当大小的任务，过小的任务消息开销大，过大的任务不利于分布式处理
+2. **错误处理**：在任务中妥善处理异常，避免服务崩溃
+3. **状态更新**：对于长时间运行的任务，定期更新进度状态
+4. **服务命名**：使用有意义的服务名称和任务名称，便于管理和调试
+5. **监控**：定期检查队列状态和服务健康状态
+6. **增量扩展**：根据系统负载，逐步添加更多worker实例，而不是一次性部署过多

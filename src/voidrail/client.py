@@ -3,50 +3,47 @@ from typing import Dict, Any, Optional, List, Union
 from celery import Celery
 from celery.result import AsyncResult
 
+# 导入共享配置
+from voidrail.config import get_config, create_celery_app
+
 class CeleryClient:
     """
     Celery客户端基类，提供通用的任务调用接口
     """
     
     def __init__(self, 
-                 service_name: str,
-                 broker_url: Optional[str] = None,
-                 backend_url: Optional[str] = None):
+                service_name: str,
+                broker_url: Optional[str] = None,
+                backend_url: Optional[str] = None):
         """
         初始化客户端基类
         
         参数:
             service_name: 服务名称
-            broker_url: 消息代理URL，默认从环境变量CELERY_BROKER_URL获取
-            backend_url: 结果后端URL，默认从环境变量CELERY_RESULT_BACKEND获取
+            broker_url: 消息代理URL，默认从配置获取
+            backend_url: 结果后端URL，默认从配置获取
         """
         self.service_name = service_name
         
-        # 从环境变量获取配置
-        self.broker_url = broker_url or os.environ.get(
-            'CELERY_BROKER_URL', 'redis://localhost:6379/0')
-        self.backend_url = backend_url or os.environ.get(
-            'CELERY_RESULT_BACKEND', self.broker_url)
+        # 获取统一配置
+        config = get_config()
+        
+        # 从参数或配置获取连接信息
+        self.broker_url = broker_url or config['broker_url']
+        self.backend_url = backend_url or config['result_backend']
         
         # 创建轻量级Celery应用
-        self.app = Celery(f'{service_name}_client',
-                        broker=self.broker_url,
-                        backend=self.backend_url)
-        
-        # 最小化配置
-        self.app.conf.update(
-            task_serializer='json',
-            accept_content=['json'],
-            result_serializer='json',
-            result_expires=86400,
+        self.app = create_celery_app(
+            f'{service_name}_client',
+            {'broker_url': self.broker_url, 'result_backend': self.backend_url}
         )
     
-    def send_task(self, 
-                 task_name: str, 
-                 args: Optional[List] = None, 
-                 kwargs: Optional[Dict] = None,
-                 wait_result: bool = False,
-                 timeout: int = 60) -> Dict[str, Any]:
+    def call(self, 
+                task_name: str, 
+                args: Optional[List] = None, 
+                kwargs: Optional[Dict] = None,
+                wait_result: bool = True,
+                timeout: int = 60) -> Dict[str, Any]:
         """
         发送任务到服务端
         

@@ -2,22 +2,32 @@ import sys
 import os
 import time
 import json
+from voidrail.config import get_config  # 导入共享配置
 from voidrail.client import CeleryClient
 
 def main():
     """示例客户端脚本"""
+    # 获取配置信息
+    config = get_config()
+    print(f"使用配置: Broker={config['broker_url']}")
+    
     # 创建客户端
     client = CeleryClient(service_name="hello")
     
     # 列出可用任务
     print("可用任务:")
     tasks = client.list_registered_tasks()
-    for task in tasks:
-        print(f"  - {task}")
+    
+    # 如果没有任务，可能是worker尚未启动
+    if not tasks:
+        print("  未发现任务。请确认worker已启动。")
+    else:
+        for task in tasks:
+            print(f"  - {task}")
     
     # 异步调用
     print("\n异步调用测试:")
-    async_result = client.send_task(
+    async_result = client.call(
         task_name="say_hello",
         args=["Async World"],
         wait_result=False
@@ -36,7 +46,7 @@ def main():
     
     # 同步调用
     print("\n同步调用测试:")
-    sync_result = client.send_task(
+    sync_result = client.call(
         task_name="say_hello",
         args=["Sync World"],
         wait_result=True
@@ -47,7 +57,7 @@ def main():
     
     # 带进度的任务
     print("\n带进度的任务测试:")
-    progress_result = client.send_task(
+    progress_result = client.call(
         task_name="say_hello_delay",
         args=["Progress World"],
         kwargs={"delay": 2},
