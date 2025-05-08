@@ -1,9 +1,5 @@
-import sys
-import os
 import time
-import json
-from voidrail.config import get_config  # 导入共享配置
-from voidrail.client import CeleryClient
+from voidrail import CeleryClient, get_config
 
 def main():
     """示例客户端脚本"""

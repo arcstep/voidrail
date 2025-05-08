@@ -1,6 +1,4 @@
 import os
-from typing import Dict, Any, List, Optional
-from celery import Celery
 
 def get_config():
     """获取统一的配置项"""
@@ -25,47 +23,3 @@ def get_worker_argv():
         f'--concurrency={config["worker_concurrency"]}',
         f'--pool={config["pool"]}'
     ]
-
-def create_celery_app(name: str, custom_config: Optional[Dict[str, Any]] = None) -> Celery:
-    """
-    创建并配置Celery应用
-    
-    参数:
-        name: 应用名称
-        custom_config: 自定义配置项，覆盖默认配置
-    
-    返回:
-        配置好的Celery应用实例
-    """
-    config = get_config()
-    
-    # 合并自定义配置
-    if custom_config:
-        for key, value in custom_config.items():
-            config[key] = value
-    
-    app = Celery(name)
-    app.conf.update(
-        broker_url=config['broker_url'],
-        result_backend=config['result_backend'],
-        task_serializer='json',
-        accept_content=['json'],
-        result_serializer='json',
-        worker_concurrency=config['worker_concurrency'],
-        task_time_limit=config['task_time_limit'],
-        task_soft_time_limit=config['task_soft_time_limit'],
-        worker_prefetch_multiplier=1,
-        task_acks_late=True,
-        task_track_started=True,
-        result_expires=config['result_expires'],
-    )
-    
-    return app
-
-# 创建默认的全局Celery应用
-default_app = create_celery_app('voidrail')
-
-# 提供简化的任务装饰器
-def task(*args, **kwargs):
-    """简化的任务装饰器，使用默认的全局Celery应用"""
-    return default_app.task(*args, **kwargs)

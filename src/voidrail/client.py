@@ -4,7 +4,8 @@ from celery import Celery
 from celery.result import AsyncResult
 
 # 导入共享配置
-from voidrail.config import get_config, create_celery_app
+from .config import get_config
+from .factory import create_app
 
 class CeleryClient:
     """
@@ -33,7 +34,7 @@ class CeleryClient:
         self.backend_url = backend_url or config['result_backend']
         
         # 创建轻量级Celery应用
-        self.app = create_celery_app(
+        self.app = create_app(
             f'{service_name}_client',
             {'broker_url': self.broker_url, 'result_backend': self.backend_url}
         )
