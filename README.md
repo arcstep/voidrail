@@ -138,9 +138,6 @@ voidrail router --dealer-keys dealer_key1 --client-keys client_key1
 # 启动单个实例
 voidrail dealer --module my_service --class SimpleService
 
-# 启动多个实例（每个实例在独立进程中运行）
-voidrail dealer --module my_service --class SimpleService --instances 4
-
 # 使用 API 密钥认证
 voidrail dealer --api-key your_dealer_key --module my_service
 ```
@@ -172,16 +169,16 @@ VoidRail 特别适合分布式部署，可以将 DEALER 服务部署在多台机
 
     ```bash
     # 在机器 A
-    voidrail dealer --host central_server_ip --port 5555 --module my_service
+    voidrail dealer --host router_bus_ip --port 5555 --module my_service
     
     # 在机器 B
-    voidrail dealer --host central_server_ip --port 5555 --module my_service
+    voidrail dealer --host router_bus_ip --port 5555 --module my_service
     ```
 
 3. **客户端连接**：在应用中连接到中央 ROUTER
 
     ```python
-    client = ClientDealer(router_address="tcp://central_server_ip:5555")
+    client = ClientDealer(router_address="tcp://router_bus_ip:5555")
     ```
 
 ## 安全建议

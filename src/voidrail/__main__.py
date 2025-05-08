@@ -29,12 +29,12 @@ def cli(debug):
 
 @cli.command()
 @click.option('--host', '-h', default='127.0.0.1', help='路由器监听地址')
-@click.option('--port', '-p', default=5555, help='路由器监听端口')
-@click.option('--heartbeat', default=30.0, help='心跳超时时间（秒）')
+@click.option('--port', '-p', default=31571, help='路由器监听端口')
+@click.option('--heartbeat', default=5.0, help='心跳超时时间（秒）')
 @click.option('--dealer-keys', multiple=True, help='允许的服务端API密钥 (可指定多次)')
 @click.option('--client-keys', multiple=True, help='允许的客户端API密钥 (可指定多次)')
 @click.option('--logger-level', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']), default='INFO', help='日志级别')
-def router(host, port, mode, heartbeat, dealer_keys, client_keys, logger_level):
+def router(host, port, heartbeat, dealer_keys, client_keys, logger_level):
     """启动VoidRail Router服务"""
     address = f"tcp://{host}:{port}"
     # 1) 先把字符串级别转成 logging 常量
@@ -55,8 +55,6 @@ def router(host, port, mode, heartbeat, dealer_keys, client_keys, logger_level):
         )
         await router.start()
         click.echo(f"Router 已启动: {address}") 
-        click.echo(f"模式: {mode}")
-        click.echo(f"认证: {'已启用' if require_auth else '未启用'}")
         
         # 设置信号处理和停止保护
         stop_event = asyncio.Event()
@@ -99,7 +97,7 @@ def router(host, port, mode, heartbeat, dealer_keys, client_keys, logger_level):
 
 @cli.command()
 @click.option('--host', '-h', default='127.0.0.1', help='Router地址')
-@click.option('--port', '-p', default=5555, help='Router端口')
+@click.option('--port', '-p', default=31571, help='Router端口')
 @click.option('--list', '-l', is_flag=True, help='列出所有可用服务和方法')
 @click.option('--router-info', is_flag=True, help='显示路由器信息')
 @click.option('--queue-status', is_flag=True, help='显示队列状态')
@@ -269,10 +267,10 @@ def client(host, port, list, router_info, queue_status, call, args, timeout, api
 
 @cli.command()
 @click.option('--host', '-h', default='127.0.0.1', help='Router地址')
-@click.option('--port', '-p', default=5555, help='Router端口')
+@click.option('--port', '-p', default=31571, help='Router端口')
 @click.option('--module', '-m', required=True, help='包含ServiceDealer类的Python模块路径')
 @click.option('--class', 'class_names', multiple=True, help='ServiceDealer类名(可多次指定，不指定则自动推断)')
-@click.option('--heartbeat', default=3.0, type=float, help='心跳发送间隔（秒）')
+@click.option('--heartbeat', default=5.0, type=float, help='心跳发送间隔（秒）')
 @click.option('--api-key', help='API认证密钥')
 @click.option('--logger-level', 
               type=click.Choice(['DEBUG','INFO','WARNING','ERROR','CRITICAL']), 

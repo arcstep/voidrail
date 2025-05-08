@@ -1,12 +1,12 @@
 [project]
 name = "voidrail"
-version = "0.2.2"
+version = "0.2.3"
 description = ""
 authors = [
     {name = "arcstep",email = "43801@qq.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<4.0"
 dependencies = [
     "pyzmq (>=26.4.0,<27.0.0)",
     "pydantic (>=2.11.3,<3.0.0)",

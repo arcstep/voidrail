@@ -545,16 +545,17 @@ class ServiceDealer(metaclass=ServiceDealerMeta):
                         for chunk in handler(self, *req.get("args", []), **req.get("kwargs", {})):
                             self._send(client_id, {"type":"streaming","request_id":request_id,"data":chunk})
                     except Exception as e:
-                        self._logger.error(f"同步生成器异常: {e}", exc_info=True)
+                        self._logger.error("流方法处理异常: %s", e, exc_info=True)
                         self._send(client_id, {"type":"error","error": str(e)})
-                        return  # 防止发送 end 标记
                 
-                # 发送结束标记
-                self._send(client_id, {"type":"end","request_id":request_id})
             except Exception as e:
                 # 完全异常处理
                 self._logger.error("流方法处理异常: %s", e, exc_info=True)
                 self._send(client_id, {"type":"error","error": str(e)})
+
+            finally:
+                # 无论成功还是异常，都发送结束标记
+                self._send(client_id, {"type":"end","request_id":request_id})
             return
 
         # 非流式，单次调用
