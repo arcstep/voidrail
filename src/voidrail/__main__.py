@@ -2,23 +2,52 @@ import os
 import sys
 import click
 import logging
+import importlib
 
 from voidrail import CeleryClient, start, create_app, get_config
-
-from .example.hello_service import app
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("voidrail")
 
-@click.group()
-def cli():
+def load_app_from_module(module_path):
+    """动态加载指定模块中的app对象"""
+    try:
+        module = importlib.import_module(module_path)
+        if not hasattr(module, 'app'):
+            raise AttributeError(f"模块 {module_path} 没有导出 'app' 对象")
+        return module.app
+    except ImportError:
+        click.echo(f"错误: 无法导入模块 {module_path}", err=True)
+        sys.exit(1)
+    except AttributeError as e:
+        click.echo(f"错误: {str(e)}", err=True)
+        click.echo(f"确保模块 {module_path} 包含一个名为 'app' 的Celery应用实例", err=True)
+        sys.exit(1)
+
+@click.group(invoke_without_command=True)
+@click.option("--module", "-m", default='voidrail.echo', help="要加载的模块路径，例如'myproject.tasks'")
+@click.pass_context
+def cli(ctx, module):
     """VoidRail分布式任务处理框架命令行工具"""
-    pass
+    # 保存module参数以供后续子命令使用
+    ctx.ensure_object(dict)
+    ctx.obj['module'] = module
+    
+    # 修改点2: 当没有指定子命令时，默认执行worker命令
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(start_celery_worker)
 
 @cli.command("worker")
-def start_celery_worker():
+@click.option("--module", "-m", default=None, help="要加载的模块路径，例如'myproject.tasks'")
+@click.pass_context
+def start_celery_worker(ctx, module):
     """启动Worker服务"""
+    # 使用命令行参数或从父命令获取模块路径
+    module_path = module or ctx.obj.get('module', 'voidrail.echo')
+    
+    # 加载app
+    app = load_app_from_module(module_path)
 
     # 显示配置信息
     config = get_config()
@@ -29,7 +58,7 @@ def start_celery_worker():
     # 显示已注册的任务
     tasks = [t for t in app.tasks.keys() if not t.startswith('celery.')]
     if tasks:
-        click.echo("已注册任务:")
+        click.echo(f"已注册任务 (来自模块 {module_path}):")
         for task_name in tasks:
             click.echo(f"  - {task_name}")
     else:
@@ -149,8 +178,16 @@ def list_tasks(service):
         click.echo(f"获取任务列表失败: {str(e)}", err=True)
 
 @cli.command("info")
-def show_info():
-    """显示VoidRail配置信息"""
+@click.option("--module", "-m", default=None, help="要加载的模块路径，例如'myproject.tasks'")
+@click.pass_context
+def show_info(ctx, module):
+    """显示指定模块的配置信息"""
+    # 使用命令行参数或从父命令获取模块路径
+    module_path = module or ctx.obj.get('module', 'voidrail.echo')
+    
+    # 加载app
+    app = load_app_from_module(module_path)
+    
     config = get_config()
     click.echo("VoidRail配置信息:")
     for key, value in config.items():
@@ -159,7 +196,7 @@ def show_info():
     # 显示已注册的任务
     tasks = [t for t in app.tasks.keys() if not t.startswith('celery.')]
     if tasks:
-        click.echo("\n已注册任务:")
+        click.echo(f"\n已注册任务 (来自模块 {module_path}):")
         for task_name in tasks:
             click.echo(f"  - {task_name}")
 
@@ -178,4 +215,5 @@ def _preview(content, max_length=100):
     return content[:max_length] + "... [内容已截断]"
 
 if __name__ == "__main__":
-    cli()
+    # 修改点3: 确保传递对象字典
+    cli(obj={})
