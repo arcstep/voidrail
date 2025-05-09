@@ -10,7 +10,7 @@ def get_config():
         'task_time_limit': int(os.environ.get('CELERY_TASK_TIME_LIMIT', 3600)),
         'task_soft_time_limit': int(os.environ.get('CELERY_TASK_SOFT_TIME_LIMIT', 3000)),
         'log_level': os.environ.get('CELERY_LOG_LEVEL', 'info'),
-        'pool': os.environ.get('CELERY_POOL', 'solo'),
+        'pool': os.environ.get('CELERY_POOL', 'prefork'),
         'result_expires': int(os.environ.get('CELERY_RESULT_EXPIRES', 86400)),
     }
 

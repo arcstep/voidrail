@@ -33,9 +33,9 @@ class CeleryClient:
         self.broker_url = broker_url or config['broker_url']
         self.backend_url = backend_url or config['result_backend']
         
-        # 创建轻量级Celery应用
+        # 客户端与Worker使用相同的service_name作为app名称，以保证路由到正确队列
         self.app = create_app(
-            f'{service_name}_client',
+            service_name,
             {'broker_url': self.broker_url, 'result_backend': self.backend_url}
         )
     
@@ -64,11 +64,12 @@ class CeleryClient:
         else:
             full_task_name = task_name
         
-        # 发送任务
+        # 指定发送到与service_name同名的队列
         task = self.app.send_task(
             full_task_name,
             args=args or [],
-            kwargs=kwargs or {}
+            kwargs=kwargs or {},
+            queue=self.service_name
         )
         
         if wait_result:
@@ -127,20 +128,39 @@ class CeleryClient:
             return task.result
         return None
     
-    def list_registered_tasks(self) -> List[str]:
-        """列出服务端所有已注册的任务"""
+    def list_registered_tasks(self, include_workers=False) -> Union[List[str], Dict[str, List[str]]]:
+        """
+        列出服务端所有已注册的任务
+        
+        参数:
+            include_workers: 是否包含worker信息
+            
+        返回:
+            如果include_workers为False，返回任务列表
+            如果include_workers为True，返回{worker名称: [任务列表]}字典
+        """
         try:
             inspection = self.app.control.inspect()
             registered = inspection.registered() or {}
             
-            # 提取所有任务名称
-            tasks = []
-            for worker_tasks in registered.values():
-                tasks.extend(worker_tasks)
-            
-            # 过滤掉Celery内部任务
-            return [task for task in tasks if not task.startswith('celery.')]
+            if not include_workers:
+                # 旧行为：返回所有任务的列表（去重）
+                tasks_set = set()
+                for worker_tasks in registered.values():
+                    tasks_set.update(worker_tasks)
+                return sorted([task for task in tasks_set if not task.startswith('celery.')])
+            else:
+                # 新行为：返回带worker信息的字典
+                result = {}
+                for worker_name, worker_tasks in registered.items():
+                    # 过滤掉Celery内部任务
+                    filtered_tasks = [task for task in worker_tasks if not task.startswith('celery.')]
+                    if filtered_tasks:  # 只包含有任务的worker
+                        result[worker_name] = sorted(filtered_tasks)
+                return result
         except Exception as e:
+            if include_workers:
+                return {"error": [str(e)]}
             return [f"Error listing tasks: {str(e)}"]
     
     def get_worker_stats(self) -> Dict[str, Any]:
