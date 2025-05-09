@@ -35,6 +35,7 @@ VoidRail 采用两组件架构：
 ### 简单例子
 
 ```python
+# echo.py
 import time
 from voidrail import create_app
 
@@ -66,8 +67,8 @@ def say_hello_delay(self, name, delay=3):
 安装完成后，你可以通过命令行来启动服务或调用任务，无需额外代码：
 
 ```bash
-# 启动 Worker（加载自定义模块 myproject.tasks）
-python -m voidrail --module myproject.tasks
+# 启动 Worker（加载本地文件自定义模块 echo.py）
+python -m voidrail --module echo
 
 # 调用任务
 python -m voidrail call echo.say_hello -a World
