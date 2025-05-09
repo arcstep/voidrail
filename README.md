@@ -12,6 +12,17 @@ VoidRail 基于 Celery 构建轻量级分布式任务处理框架，专为 CPU �
 pip install voidrail
 ```
 
+**依赖说明**  
+VoidRail 默认使用 Redis 作为 Broker 和结果后端，因此在启动 Worker 或客户端前，需要先确保 Redis 服务已运行（默认端口为 6379）。可以使用以下方式启动 Redis：
+
+```bash
+# 本地启动（需先安装 Redis）
+redis-server
+
+# 或使用 Docker 启动
+docker run -d --name voidrail-redis -p 6379:6379 redis
+```
+
 ## 核心组件
 
 VoidRail 采用两组件架构：
@@ -24,17 +35,17 @@ VoidRail 采用两组件架构：
 ### 简单例子
 
 ```python
-import sys
-import os
 import time
-from voidrail import app, start_worker, get_config
+from voidrail import create_app
 
-@app.task(name='hello.say_hello')
+app = create_app('echo')
+
+@app.task(name='echo.say_hello')
 def say_hello(name):
     """简单的问候任务"""
     return f"Hello, {name}! Current time: {time.ctime()}"
 
-@app.task(name='hello.say_hello_delay', bind=True)
+@app.task(name='echo.say_hello_delay', bind=True)
 def say_hello_delay(self, name, delay=3):
     """带延迟的问候任务，演示任务状态更新"""
     self.update_state(state='PROGRESS', meta={'progress': 0, 'message': '开始处理'})
@@ -48,53 +59,62 @@ def say_hello_delay(self, name, delay=3):
         })
     
     return f"Hello after {delay} seconds, {name}! Time: {time.ctime()}"
+```
 
-def main():
-    """命令行入口点"""
-    # 显示服务信息
-    config = get_config()
-    print(f"Broker URL: {config['broker_url']}")
-    print(f"后端 URL: {config['result_backend']}")
-    
-    # 启动Worker
-    start_worker()
+### 命令行工具
 
-if __name__ == "__main__":
-    main()
+安装完成后，你可以通过命令行来启动服务或调用任务，无需额外代码：
 
+```bash
+# 启动 Worker（加载自定义模块 myproject.tasks）
+python -m voidrail --module myproject.tasks
+
+# 调用任务
+python -m voidrail call echo.say_hello -a World
+
+# 查看帮助信息
+python -m voidrail --help
 ```
 
 ### 使用客户端
 
+你也可以通过代码来访问已经启动的服务。
+
 ```python
-import sys
-import os
-import time
-import json
-from voidrail.config import get_config
 from voidrail.client import CeleryClient
 
 # 创建客户端
-client = CeleryClient(service_name="hello")
+client = CeleryClient(service_name="echo")
 
-# 同步调用
+# 同步调用任务
 result = client.call(
     task_name="say_hello",
     args=["World"]
 )
-print(result["result"])  # 输出: Hello, World!
+print(result["result"])  # Hello, World!
 
-# 异步调用
-async_result = client.call(
+# 异步调用任务
+async_res = client.call(
     task_name="say_hello_delay",
     args=["Async World"],
     kwargs={"delay": 2},
     wait_result=False
 )
-task_id = async_result["task_id"]
+task_id = async_res["task_id"]
+print(f"任务已提交，ID: {task_id}")
 
-# 检查任务状态
+# 查询任务状态
 status = client.get_task_status(task_id)
+print(f"任务状态: {status['status']}")
+
+# 获取最终结果（可在状态为 completed 后调用）
+if status["status"] == "completed":
+    final_res = client.get_task_result(task_id)
+    print(f"结果: {final_res}")
+
+# 列出当前注册的任务
+tasks = client.list_registered_tasks()
+print("可用任务:", tasks)
 ```
 
 ### 水平扩展能力
