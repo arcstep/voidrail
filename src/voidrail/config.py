@@ -2,10 +2,11 @@ import os
 
 def get_config():
     """获取统一的配置项"""
+    default_broker_url = 'redis://localhost:6379/0'
+    default_result_backend = default_broker_url
     return {
-        'broker_url': os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0'),
-        'result_backend': os.environ.get('CELERY_RESULT_BACKEND', 
-                          os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0')),
+        'broker_url': os.environ.get('CELERY_BROKER_URL', default_broker_url),
+        'result_backend': os.environ.get('CELERY_RESULT_BACKEND', default_result_backend),
         'worker_concurrency': int(os.environ.get('CELERY_CONCURRENCY', 4)),
         'task_time_limit': int(os.environ.get('CELERY_TASK_TIME_LIMIT', 3600)),
         'task_soft_time_limit': int(os.environ.get('CELERY_TASK_SOFT_TIME_LIMIT', 3000)),

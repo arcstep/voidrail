@@ -269,10 +269,12 @@ def diagnose_environment():
     """显示详细的环境和配置诊断信息"""
     import sys
     import celery
-    
+    from .__version__ import __version__ as void_version
+
     click.echo("VoidRail诊断信息:")
     click.echo(f"Python版本: {sys.version}")
     click.echo(f"Celery版本: {celery.__version__}")
+    click.echo(f"VoidRail版本: {void_version}")
     
     # 导入临时应用进行测试
     test_app = create_app("test_diagnose")
